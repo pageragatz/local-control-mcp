@@ -1,10 +1,17 @@
-# Deezer MCP Server
+# Deezer + Last.fm MCP Server
 
-A Model Context Protocol (MCP) server for the Deezer API — search and explore music content (tracks, artists, albums, playlists, charts, and genres).
+A Model Context Protocol (MCP) server combining the Deezer catalog with personalized Last.fm listening data. Search and explore music, see what you're playing right now, love tracks, and scrobble — all from an LLM agent.
 
 ![Example usage](exemple.png)
 
 ## Features
+
+### Last.fm Personalization
+- **Now playing**: See the track currently playing (via Deezer → Last.fm scrobbling)
+- **Listening history**: Recent tracks, top tracks and artists by time period
+- **Loved tracks**: Your hearted tracks
+- **Write actions**: Love/unlove tracks, submit scrobbles, push now-playing status
+- **Discovery**: Similar artists via Last.fm's similarity graph, track tags and wiki
 
 ### Search
 - **Tracks**: Basic and advanced search with artist, BPM, duration, and label filters
@@ -37,6 +44,22 @@ A Model Context Protocol (MCP) server for the Deezer API — search and explore 
 | `get_genre_artists` | Popular artists in a genre | genre_id, limit |
 | `get_chart` | Current music charts | genre_id (0=all), limit |
 
+### Last.fm Tools
+
+| Tool | Auth needed | Description |
+|------|-------------|-------------|
+| `lastfm_get_now_playing` | API key | Currently playing track |
+| `lastfm_get_recent_tracks` | API key | Listening history |
+| `lastfm_get_top_tracks` | API key | Most played tracks by period |
+| `lastfm_get_top_artists` | API key | Most played artists by period |
+| `lastfm_get_loved_tracks` | API key | Hearted tracks |
+| `lastfm_get_similar_artists` | API key | Artists similar to a given one |
+| `lastfm_get_track_info` | API key | Tags, wiki, play counts |
+| `lastfm_love_track` | Session key | Heart a track |
+| `lastfm_unlove_track` | Session key | Unheart a track |
+| `lastfm_update_now_playing` | Session key | Push now-playing status |
+| `lastfm_scrobble` | Session key | Submit a listen record |
+
 ## Installation
 
 ### Prerequisites
@@ -52,6 +75,13 @@ source .venv/bin/activate
 
 # Install dependencies
 uv pip install -r requirements.txt
+
+# Copy and fill in your credentials
+cp .env.example .env
+# Edit .env with your LASTFM_API_KEY, LASTFM_API_SECRET, LASTFM_USERNAME
+
+# (Optional) Generate a session key for write operations
+uv run lastfm_auth.py
 
 # Start the server
 uv run deezer_mcp_server.py
@@ -80,6 +110,25 @@ docker compose down
 | `MCP_PORT` | `8000` | Port to listen on |
 | `MCP_TRANSPORT` | `sse` | Transport type (`sse` or `stdio`) |
 
+## Last.fm Setup
+
+### 1. Get an API key
+Register at [last.fm/api/account/create](https://www.last.fm/api/account/create) — it's free and instant.
+Copy `LASTFM_API_KEY` and `LASTFM_API_SECRET` into your `.env`.
+
+### 2. Enable scrobbling from Deezer
+In the Deezer app: **Settings → Connections → Last.fm** — log in and enable scrobbling.
+Now anything you play in Deezer will appear in `lastfm_get_now_playing`.
+
+### 3. (Optional) Generate a session key for write access
+Write operations (love/unlove, scrobble, now-playing) need a session key:
+
+```bash
+uv run lastfm_auth.py
+```
+
+This opens a browser auth page, then prints your `LASTFM_SESSION_KEY`. Add it to `.env`.
+
 ## Client Configuration
 
 ### AnythingLLM
@@ -94,6 +143,7 @@ AnythingLLM supports MCP servers. To connect:
 {
   "mcpServers": {
     "deezer": {
+      "type": "sse",
       "url": "http://localhost:8000/sse"
     }
   }

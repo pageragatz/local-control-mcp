@@ -1,16 +1,22 @@
 """
 Deezer MCP Server
 Provides search, retrieval, and exploration of music content via the Deezer API.
+Also integrates Last.fm for personalized listening data and track management.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
+import time
 from typing import Dict, Any, Optional
 import aiohttp
+from dotenv import load_dotenv
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field, field_validator
 import json
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,6 +25,13 @@ mcp = FastMCP("Deezer Music Server")
 
 BASE_URL = "https://api.deezer.com"
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+# Last.fm configuration (read from environment)
+LASTFM_BASE_URL = "https://ws.audioscrobbler.com/2.0/"
+LASTFM_API_KEY = os.environ.get("LASTFM_API_KEY", "")
+LASTFM_API_SECRET = os.environ.get("LASTFM_API_SECRET", "")
+LASTFM_USERNAME = os.environ.get("LASTFM_USERNAME", "")
+LASTFM_SESSION_KEY = os.environ.get("LASTFM_SESSION_KEY", "")
 
 VALID_ORDERS = [
     "RANKING", "TRACK_ASC", "TRACK_DESC", "ARTIST_ASC", "ARTIST_DESC",
@@ -541,6 +554,381 @@ async def get_chart(genre_id: int = 0, limit: int = 10) -> Dict[str, Any]:
             return {"success": False, "error": str(e)}
 
 
+# ── Last.fm helpers ──────────────────────────────────────────────────────────
+
+def _lastfm_sign(params: Dict[str, str]) -> str:
+    """Compute Last.fm API signature: MD5 of sorted key+value pairs + secret."""
+    pairs = "".join(f"{k}{v}" for k, v in sorted(params.items()) if k not in ("format", "callback"))
+    return hashlib.md5((pairs + LASTFM_API_SECRET).encode("utf-8")).hexdigest()
+
+
+async def lastfm_get(session: aiohttp.ClientSession, method: str, extra: Dict = None) -> Dict[str, Any]:
+    """Make an authenticated GET request to the Last.fm API."""
+    if not LASTFM_API_KEY:
+        raise ValueError("LASTFM_API_KEY environment variable is not set")
+    params = {"method": method, "api_key": LASTFM_API_KEY, "format": "json"}
+    if extra:
+        params.update(extra)
+    async with session.get(LASTFM_BASE_URL, params=params) as response:
+        data = await response.json()
+        if "error" in data:
+            raise ValueError(f"Last.fm error {data['error']}: {data.get('message', '')}")
+        return data
+
+
+async def lastfm_post(session: aiohttp.ClientSession, method: str, extra: Dict = None) -> Dict[str, Any]:
+    """Make a signed POST request to the Last.fm write API."""
+    if not LASTFM_API_KEY or not LASTFM_API_SECRET:
+        raise ValueError("LASTFM_API_KEY and LASTFM_API_SECRET must be set for write operations")
+    if not LASTFM_SESSION_KEY:
+        raise ValueError("LASTFM_SESSION_KEY must be set for write operations — run lastfm_auth.py to generate one")
+    params = {"method": method, "api_key": LASTFM_API_KEY, "sk": LASTFM_SESSION_KEY}
+    if extra:
+        params.update(extra)
+    params["api_sig"] = _lastfm_sign(params)
+    params["format"] = "json"
+    async with session.post(LASTFM_BASE_URL, data=params) as response:
+        data = await response.json()
+        if "error" in data:
+            raise ValueError(f"Last.fm error {data['error']}: {data.get('message', '')}")
+        return data
+
+
+# ── Last.fm read tools ────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def lastfm_get_now_playing(username: str = "") -> Dict[str, Any]:
+    """
+    Get the track currently playing (or most recently played) for a Last.fm user.
+
+    Requires Deezer (or any player) to be scrobbling to Last.fm. The response
+    includes a 'now_playing' boolean flag.
+
+    Args:
+        username: Last.fm username. Defaults to LASTFM_USERNAME env var if not provided.
+
+    Returns:
+        Dict with track title, artist, album, and whether it is currently playing.
+    """
+    user = username or LASTFM_USERNAME
+    if not user:
+        return {"success": False, "error": "No username provided and LASTFM_USERNAME is not set"}
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        try:
+            data = await lastfm_get(session, "user.getRecentTracks", {"user": user, "limit": "1", "extended": "1"})
+            tracks = data.get("recenttracks", {}).get("track", [])
+            if not tracks:
+                return {"success": True, "now_playing": False, "track": None}
+            track = tracks[0]
+            now_playing = track.get("@attr", {}).get("nowplaying") == "true"
+            return {
+                "success": True,
+                "now_playing": now_playing,
+                "track": {
+                    "title": track.get("name"),
+                    "artist": track.get("artist", {}).get("name") or track.get("artist", {}).get("#text"),
+                    "album": track.get("album", {}).get("#text"),
+                    "url": track.get("url"),
+                    "image": next((i["#text"] for i in track.get("image", []) if i["size"] == "large"), None),
+                    "loved": track.get("loved") == "1",
+                },
+            }
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def lastfm_get_recent_tracks(username: str = "", limit: int = 10) -> Dict[str, Any]:
+    """
+    Get the recent listening history for a Last.fm user.
+
+    Args:
+        username: Last.fm username. Defaults to LASTFM_USERNAME env var.
+        limit: Number of tracks to return (default 10, max 50).
+
+    Returns:
+        Dict with list of recently played tracks including timestamps.
+    """
+    user = username or LASTFM_USERNAME
+    if not user:
+        return {"success": False, "error": "No username provided and LASTFM_USERNAME is not set"}
+    limit = max(1, min(limit, 50))
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        try:
+            data = await lastfm_get(session, "user.getRecentTracks", {"user": user, "limit": str(limit)})
+            raw = data.get("recenttracks", {}).get("track", [])
+            tracks = []
+            for t in raw:
+                tracks.append({
+                    "title": t.get("name"),
+                    "artist": t.get("artist", {}).get("#text"),
+                    "album": t.get("album", {}).get("#text"),
+                    "now_playing": t.get("@attr", {}).get("nowplaying") == "true",
+                    "played_at": t.get("date", {}).get("#text"),
+                    "url": t.get("url"),
+                })
+            return {"success": True, "username": user, "tracks": tracks}
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+
+LASTFM_PERIODS = ["overall", "7day", "1month", "3month", "6month", "12month"]
+
+
+@mcp.tool()
+async def lastfm_get_top_tracks(username: str = "", period: str = "1month", limit: int = 10) -> Dict[str, Any]:
+    """
+    Get a user's most played tracks on Last.fm over a given time period.
+
+    Args:
+        username: Last.fm username. Defaults to LASTFM_USERNAME env var.
+        period: Time period — one of: overall, 7day, 1month, 3month, 6month, 12month.
+        limit: Number of tracks (default 10, max 50).
+
+    Returns:
+        Dict with ranked list of top tracks and play counts.
+    """
+    user = username or LASTFM_USERNAME
+    if not user:
+        return {"success": False, "error": "No username provided and LASTFM_USERNAME is not set"}
+    if period not in LASTFM_PERIODS:
+        return {"success": False, "error": f"period must be one of {LASTFM_PERIODS}"}
+    limit = max(1, min(limit, 50))
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        try:
+            data = await lastfm_get(session, "user.getTopTracks", {"user": user, "period": period, "limit": str(limit)})
+            raw = data.get("toptracks", {}).get("track", [])
+            tracks = [{"rank": t.get("@attr", {}).get("rank"), "title": t.get("name"),
+                       "artist": t.get("artist", {}).get("name"), "play_count": t.get("playcount"),
+                       "url": t.get("url")} for t in raw]
+            return {"success": True, "username": user, "period": period, "tracks": tracks}
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def lastfm_get_top_artists(username: str = "", period: str = "1month", limit: int = 10) -> Dict[str, Any]:
+    """
+    Get a user's most played artists on Last.fm over a given time period.
+
+    Args:
+        username: Last.fm username. Defaults to LASTFM_USERNAME env var.
+        period: Time period — one of: overall, 7day, 1month, 3month, 6month, 12month.
+        limit: Number of artists (default 10, max 50).
+
+    Returns:
+        Dict with ranked list of top artists and play counts.
+    """
+    user = username or LASTFM_USERNAME
+    if not user:
+        return {"success": False, "error": "No username provided and LASTFM_USERNAME is not set"}
+    if period not in LASTFM_PERIODS:
+        return {"success": False, "error": f"period must be one of {LASTFM_PERIODS}"}
+    limit = max(1, min(limit, 50))
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        try:
+            data = await lastfm_get(session, "user.getTopArtists", {"user": user, "period": period, "limit": str(limit)})
+            raw = data.get("topartists", {}).get("artist", [])
+            artists = [{"rank": a.get("@attr", {}).get("rank"), "name": a.get("name"),
+                        "play_count": a.get("playcount"), "url": a.get("url")} for a in raw]
+            return {"success": True, "username": user, "period": period, "artists": artists}
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def lastfm_get_loved_tracks(username: str = "", limit: int = 20) -> Dict[str, Any]:
+    """
+    Get the tracks a user has loved (hearted) on Last.fm.
+
+    Args:
+        username: Last.fm username. Defaults to LASTFM_USERNAME env var.
+        limit: Number of loved tracks to return (default 20, max 50).
+
+    Returns:
+        Dict with list of loved tracks and the date they were loved.
+    """
+    user = username or LASTFM_USERNAME
+    if not user:
+        return {"success": False, "error": "No username provided and LASTFM_USERNAME is not set"}
+    limit = max(1, min(limit, 50))
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        try:
+            data = await lastfm_get(session, "user.getLovedTracks", {"user": user, "limit": str(limit)})
+            raw = data.get("lovedtracks", {}).get("track", [])
+            tracks = [{"title": t.get("name"), "artist": t.get("artist", {}).get("name"),
+                       "loved_at": t.get("date", {}).get("#text"), "url": t.get("url")} for t in raw]
+            return {"success": True, "username": user, "tracks": tracks}
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def lastfm_get_similar_artists(artist: str, limit: int = 10) -> Dict[str, Any]:
+    """
+    Get artists similar to a given artist according to Last.fm's similarity graph.
+
+    No authentication required — uses public Last.fm data.
+
+    Args:
+        artist: Artist name to find similar artists for.
+        limit: Number of similar artists to return (default 10, max 30).
+
+    Returns:
+        Dict with similar artists ranked by similarity score.
+    """
+    limit = max(1, min(limit, 30))
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        try:
+            data = await lastfm_get(session, "artist.getSimilar", {"artist": artist, "limit": str(limit)})
+            raw = data.get("similarartists", {}).get("artist", [])
+            artists = [{"name": a.get("name"), "similarity": float(a.get("match", 0)),
+                        "url": a.get("url")} for a in raw]
+            return {"success": True, "artist": artist, "similar_artists": artists}
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def lastfm_get_track_info(artist: str, track: str, username: str = "") -> Dict[str, Any]:
+    """
+    Get detailed info for a track from Last.fm including tags, wiki, and user play count.
+
+    Args:
+        artist: Artist name.
+        track: Track title.
+        username: Last.fm username to include personal play count and loved status.
+                  Defaults to LASTFM_USERNAME env var.
+
+    Returns:
+        Dict with track metadata, tags, wiki summary, and optional user stats.
+    """
+    user = username or LASTFM_USERNAME
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        try:
+            extra: Dict[str, str] = {"artist": artist, "track": track}
+            if user:
+                extra["username"] = user
+            data = await lastfm_get(session, "track.getInfo", extra)
+            t = data.get("track", {})
+            return {
+                "success": True,
+                "title": t.get("name"),
+                "artist": t.get("artist", {}).get("name"),
+                "album": t.get("album", {}).get("title"),
+                "duration_ms": t.get("duration"),
+                "play_count": t.get("playcount"),
+                "listeners": t.get("listeners"),
+                "loved": t.get("userloved") == "1",
+                "user_play_count": t.get("userplaycount"),
+                "tags": [tag["name"] for tag in t.get("toptags", {}).get("tag", [])],
+                "wiki": t.get("wiki", {}).get("summary", "").split("<a")[0].strip() or None,
+                "url": t.get("url"),
+            }
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+
+# ── Last.fm write tools ───────────────────────────────────────────────────────
+
+@mcp.tool()
+async def lastfm_love_track(artist: str, track: str) -> Dict[str, Any]:
+    """
+    Love (heart) a track on Last.fm. Requires write authentication (LASTFM_SESSION_KEY).
+
+    Args:
+        artist: Artist name.
+        track: Track title.
+
+    Returns:
+        Dict indicating success or failure.
+    """
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        try:
+            await lastfm_post(session, "track.love", {"artist": artist, "track": track})
+            return {"success": True, "loved": True, "artist": artist, "track": track}
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def lastfm_unlove_track(artist: str, track: str) -> Dict[str, Any]:
+    """
+    Remove the love (heart) from a track on Last.fm. Requires write authentication.
+
+    Args:
+        artist: Artist name.
+        track: Track title.
+
+    Returns:
+        Dict indicating success or failure.
+    """
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        try:
+            await lastfm_post(session, "track.unlove", {"artist": artist, "track": track})
+            return {"success": True, "loved": False, "artist": artist, "track": track}
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def lastfm_scrobble(artist: str, track: str, album: str = "", timestamp: int = 0) -> Dict[str, Any]:
+    """
+    Submit a scrobble (played track record) to Last.fm. Requires write authentication.
+
+    Args:
+        artist: Artist name.
+        track: Track title.
+        album: Album title (optional but recommended).
+        timestamp: Unix timestamp of when the track was played. Defaults to now.
+
+    Returns:
+        Dict indicating whether the scrobble was accepted.
+    """
+    ts = str(timestamp or int(time.time()))
+    extra: Dict[str, str] = {"artist": artist, "track": track, "timestamp": ts}
+    if album:
+        extra["album"] = album
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        try:
+            data = await lastfm_post(session, "track.scrobble", extra)
+            scrobbles = data.get("scrobbles", {}).get("scrobble", {})
+            accepted = scrobbles.get("ignoredMessage", {}).get("code") == "0" or "artist" in scrobbles
+            return {"success": True, "accepted": accepted, "artist": artist, "track": track}
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def lastfm_update_now_playing(artist: str, track: str, album: str = "", duration: int = 0) -> Dict[str, Any]:
+    """
+    Tell Last.fm a track is currently playing. Requires write authentication.
+
+    Use this to manually push a "now playing" status — useful if your player
+    doesn't scrobble automatically.
+
+    Args:
+        artist: Artist name.
+        track: Track title.
+        album: Album title (optional but recommended).
+        duration: Track duration in seconds (optional).
+
+    Returns:
+        Dict indicating success.
+    """
+    extra: Dict[str, str] = {"artist": artist, "track": track}
+    if album:
+        extra["album"] = album
+    if duration:
+        extra["duration"] = str(duration)
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        try:
+            await lastfm_post(session, "track.updateNowPlaying", extra)
+            return {"success": True, "artist": artist, "track": track}
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+
 # MCP Resources
 @mcp.resource("deezer://api-endpoints")
 async def get_api_endpoints() -> str:
@@ -602,29 +990,36 @@ async def get_search_examples() -> str:
 
 @mcp.prompt("deezer-search-assistant")
 async def deezer_search_assistant() -> str:
-    """System prompt for Deezer music search assistance."""
+    """System prompt for Deezer + Last.fm music assistance."""
     return """
-You are a music discovery assistant with access to the Deezer music catalog via MCP tools.
+You are a music assistant with access to both the Deezer catalog and the user's personal Last.fm listening data.
 
-You can help users with:
+## Deezer — catalog search and browsing
+- search_tracks, advanced_search — find tracks (supports artist, BPM, duration, label filters)
+- search_artists, search_albums, search_playlists — find content by name
+- get_track_details, get_artist_details, get_album_details, get_playlist_details — look up by ID
+- get_artist_albums, get_artist_top_tracks, get_artist_related, get_album_tracks — explore discographies
+- get_chart — current trending tracks/albums/artists/playlists (filter by genre)
+- get_genre_list, get_genre_artists — browse by genre
 
-1. **Track Search**: Find specific songs using search_tracks or advanced_search with criteria like artist, BPM, duration, and label.
+## Last.fm — personal listening data (read)
+- lastfm_get_now_playing — what the user is listening to right now
+- lastfm_get_recent_tracks — recent listening history
+- lastfm_get_top_tracks, lastfm_get_top_artists — most played over a period (7day/1month/3month/6month/12month/overall)
+- lastfm_get_loved_tracks — tracks the user has hearted
+- lastfm_get_similar_artists — artists similar to a given one (no auth needed)
+- lastfm_get_track_info — tags, wiki, listener counts, user play count
 
-2. **Artist Exploration**: Look up artists with search_artists, get their details with get_artist_details, browse their discography with get_artist_albums, find their hits with get_artist_top_tracks, or discover similar artists with get_artist_related.
+## Last.fm — write actions (require session key)
+- lastfm_love_track / lastfm_unlove_track — heart or unheart a track
+- lastfm_update_now_playing — push a now-playing status manually
+- lastfm_scrobble — submit a listen record
 
-3. **Album Exploration**: Find albums with search_albums, get full details with get_album_details, or list all tracks with get_album_tracks.
-
-4. **Playlists**: Search with search_playlists or get details with get_playlist_details.
-
-5. **Charts**: Get current trending music with get_chart (optionally filtered by genre).
-
-6. **Genres**: Browse all genres with get_genre_list, then find genre artists with get_genre_artists.
-
-Tips:
-- Use strict=true for exact matches, strict=false (default) for fuzzy matching
-- Use advanced_search for precise filtering: artist:"name" track:"title" bpm_min:120
-- Chain tools: search for an artist → get their ID → get their top tracks or albums
-- For music discovery: get_chart for trending, get_genre_artists for genre exploration
+## Workflow tips
+- Check what the user is playing with lastfm_get_now_playing, then use get_track_details or lastfm_get_similar_artists to go deeper
+- Use lastfm_get_top_artists to understand taste, then search Deezer for new releases by those artists
+- Combine lastfm_get_loved_tracks with advanced_search to find similar tracks by BPM or duration
+- Write operations (love, scrobble) require LASTFM_SESSION_KEY — tell the user to run lastfm_auth.py if not set
 """
 
 
