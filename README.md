@@ -143,14 +143,14 @@ AnythingLLM supports MCP servers. To connect:
 {
   "mcpServers": {
     "deezer": {
-      "type": "sse",
-      "url": "http://localhost:8000/sse"
+      "type": "streamable",
+      "url": "http://localhost:8000/mcp"
     }
   }
 }
 ```
 
-If AnythingLLM is running inside Docker and the MCP server is on your host machine, use `http://host.docker.internal:8000/sse` instead of localhost.
+If AnythingLLM is running inside Docker and the MCP server is on your host machine, use `http://host.docker.internal:8000/mcp` instead of localhost.
 
 ### Claude Desktop
 
