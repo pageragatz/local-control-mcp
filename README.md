@@ -127,7 +127,7 @@ Write operations (love/unlove, scrobble, now-playing) need a session key:
 uv run lastfm_auth.py
 ```
 
-This opens a browser auth page, then prints your `LASTFM_SESSION_KEY`. Add it to `.env`.
+This opens a browser auth page, then writes `LASTFM_SESSION_KEY` and `LASTFM_USERNAME` directly into your `.env`.
 
 ## Client Configuration
 
