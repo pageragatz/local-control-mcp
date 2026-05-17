@@ -94,6 +94,7 @@ AnythingLLM supports MCP servers. To connect:
 {
   "mcpServers": {
     "deezer": {
+      "type": "sse",
       "url": "http://localhost:8000/sse"
     }
   }
