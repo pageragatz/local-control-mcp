@@ -1026,14 +1026,15 @@ You are a music assistant with access to both the Deezer catalog and the user's 
 def main():
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8000"))
-    transport = os.environ.get("MCP_TRANSPORT", "sse")
+    transport = os.environ.get("MCP_TRANSPORT", "http")
 
     if transport == "stdio":
-        mcp.run()
-    elif transport == "sse":
-        mcp.settings.host = host
-        mcp.settings.port = port
-        mcp.run(transport="sse")
+        mcp.run(transport="stdio")
+    elif transport in ("http", "streamable-http", "sse"):
+        # stateless_http avoids the session initialization handshake that breaks
+        # some clients (including AnythingLLM) which send requests before the
+        # MCP initialize round-trip completes on a persistent SSE session.
+        mcp.run(transport=transport, host=host, port=port, stateless_http=True)
     else:
         raise ValueError(f"Unsupported transport: {transport}")
 
