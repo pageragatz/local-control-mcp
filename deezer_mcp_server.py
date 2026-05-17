@@ -636,7 +636,9 @@ def main():
     if transport == "stdio":
         mcp.run()
     elif transport == "sse":
-        mcp.run(host=host, port=port, transport="sse")
+        mcp.settings.host = host
+        mcp.settings.port = port
+        mcp.run(transport="sse")
     else:
         raise ValueError(f"Unsupported transport: {transport}")
 
