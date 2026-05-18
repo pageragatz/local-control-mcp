@@ -1,13 +1,15 @@
 """
 Deezer MCP Server
 Provides search, retrieval, and exploration of music content via the Deezer API.
-Also integrates Last.fm for personalized listening data and track management.
+Also integrates Last.fm for personalized listening data and track management,
+and Windows SMTC for real-time playback control and now-playing info.
 """
 
 import asyncio
 import hashlib
 import logging
 import os
+import sys
 import time
 from typing import Dict, Any, Optional
 import aiohttp
@@ -20,6 +22,18 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ── Windows SMTC optional import ─────────────────────────────────────────────
+SMTC_AVAILABLE = False
+if sys.platform == "win32":
+    try:
+        from winrt.windows.media.control import (
+            GlobalSystemMediaTransportControlsSessionManager as _SMTCManager,
+        )
+        from winrt.windows.media import MediaPlaybackAutoRepeatMode as _RepeatMode
+        SMTC_AVAILABLE = True
+    except ImportError:
+        logger.warning("winrt-Windows.Media.Control not installed — SMTC tools unavailable")
 
 mcp = FastMCP("Deezer Music Server")
 
@@ -929,6 +943,271 @@ async def lastfm_update_now_playing(artist: str, track: str, album: str = "", du
             return {"success": False, "error": str(e)}
 
 
+# ── SMTC helpers ─────────────────────────────────────────────────────────────
+
+_SMTC_NOT_AVAILABLE = {"success": False, "error": "SMTC requires Windows and: pip install winrt-Windows.Media.Control winrt-Windows.Media"}
+
+_PLAYBACK_STATUS = {0: "closed", 1: "opened", 2: "changing", 3: "stopped", 4: "playing", 5: "paused"}
+_REPEAT_NAMES = {"none": 0, "track": 1, "list": 2}
+_REPEAT_VALUES = {0: "none", 1: "track", 2: "list"}
+_SMTC_TIMEOUT = 5.0  # seconds before giving up on a WinRT async call
+
+
+async def _smtc_session():
+    """Return the current SMTC media session, or None if nothing is playing."""
+    manager = await asyncio.wait_for(_SMTCManager.request_async(), timeout=_SMTC_TIMEOUT)
+    return manager.get_current_session()
+
+
+# ── SMTC read tools ───────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def smtc_get_now_playing() -> Dict[str, Any]:
+    """
+    Get the track currently playing on this Windows machine via System Media Transport Controls.
+
+    Works with any media app that registers with SMTC: Deezer, Spotify, browser,
+    Windows Media Player, etc.
+
+    Returns:
+        Dict with title, artist, album, playback status, position, duration,
+        shuffle state, repeat mode, and the source application name.
+    """
+    if not SMTC_AVAILABLE:
+        return _SMTC_NOT_AVAILABLE
+    try:
+        session = await _smtc_session()
+        if not session:
+            return {"success": True, "playing": False, "track": None}
+
+        props = await asyncio.wait_for(session.try_get_media_properties_async(), timeout=_SMTC_TIMEOUT)
+        playback = session.get_playback_info()
+        timeline = session.get_timeline_properties()
+
+        status_int = int(playback.playback_status)
+        return {
+            "success": True,
+            "playing": status_int == 4,
+            "track": {
+                "title": props.title,
+                "artist": props.artist,
+                "album": props.album_title,
+                "track_number": props.track_number,
+                "status": _PLAYBACK_STATUS.get(status_int, "unknown"),
+                "position_seconds": round(timeline.position.total_seconds()),
+                "duration_seconds": round(timeline.end_time.total_seconds()),
+                "shuffle": playback.is_shuffle_active,
+                "repeat": _REPEAT_VALUES.get(int(playback.auto_repeat_mode), "unknown"),
+                "source_app": session.source_app_user_model_id,
+            },
+        }
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "SMTC request timed out"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ── SMTC playback control tools ───────────────────────────────────────────────
+
+@mcp.tool()
+async def smtc_play() -> Dict[str, Any]:
+    """
+    Resume playback of the current media session via Windows SMTC.
+
+    Returns:
+        Dict with success flag. False if no session is active or the app rejected the command.
+    """
+    if not SMTC_AVAILABLE:
+        return _SMTC_NOT_AVAILABLE
+    try:
+        session = await _smtc_session()
+        if not session:
+            return {"success": False, "error": "No active media session"}
+        ok = await asyncio.wait_for(session.try_play_async(), timeout=_SMTC_TIMEOUT)
+        return {"success": bool(ok)}
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "SMTC request timed out"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def smtc_pause() -> Dict[str, Any]:
+    """
+    Pause playback of the current media session via Windows SMTC.
+
+    Returns:
+        Dict with success flag.
+    """
+    if not SMTC_AVAILABLE:
+        return _SMTC_NOT_AVAILABLE
+    try:
+        session = await _smtc_session()
+        if not session:
+            return {"success": False, "error": "No active media session"}
+        ok = await asyncio.wait_for(session.try_pause_async(), timeout=_SMTC_TIMEOUT)
+        return {"success": bool(ok)}
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "SMTC request timed out"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def smtc_play_pause() -> Dict[str, Any]:
+    """
+    Toggle play/pause for the current media session via Windows SMTC.
+
+    Returns:
+        Dict with success flag and the new playback state.
+    """
+    if not SMTC_AVAILABLE:
+        return _SMTC_NOT_AVAILABLE
+    try:
+        session = await _smtc_session()
+        if not session:
+            return {"success": False, "error": "No active media session"}
+        playback = session.get_playback_info()
+        is_playing = int(playback.playback_status) == 4
+        if is_playing:
+            ok = await asyncio.wait_for(session.try_pause_async(), timeout=_SMTC_TIMEOUT)
+            new_state = "paused"
+        else:
+            ok = await asyncio.wait_for(session.try_play_async(), timeout=_SMTC_TIMEOUT)
+            new_state = "playing"
+        return {"success": bool(ok), "state": new_state}
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "SMTC request timed out"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def smtc_next_track() -> Dict[str, Any]:
+    """
+    Skip to the next track in the current media session via Windows SMTC.
+
+    Returns:
+        Dict with success flag.
+    """
+    if not SMTC_AVAILABLE:
+        return _SMTC_NOT_AVAILABLE
+    try:
+        session = await _smtc_session()
+        if not session:
+            return {"success": False, "error": "No active media session"}
+        ok = await asyncio.wait_for(session.try_skip_next_async(), timeout=_SMTC_TIMEOUT)
+        return {"success": bool(ok)}
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "SMTC request timed out"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def smtc_previous_track() -> Dict[str, Any]:
+    """
+    Go to the previous track in the current media session via Windows SMTC.
+
+    Returns:
+        Dict with success flag.
+    """
+    if not SMTC_AVAILABLE:
+        return _SMTC_NOT_AVAILABLE
+    try:
+        session = await _smtc_session()
+        if not session:
+            return {"success": False, "error": "No active media session"}
+        ok = await asyncio.wait_for(session.try_skip_previous_async(), timeout=_SMTC_TIMEOUT)
+        return {"success": bool(ok)}
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "SMTC request timed out"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def smtc_seek(position_seconds: float) -> Dict[str, Any]:
+    """
+    Seek to a specific position in the currently playing track via Windows SMTC.
+
+    Args:
+        position_seconds: Target position in seconds from the start of the track.
+
+    Returns:
+        Dict with success flag.
+    """
+    if not SMTC_AVAILABLE:
+        return _SMTC_NOT_AVAILABLE
+    try:
+        session = await _smtc_session()
+        if not session:
+            return {"success": False, "error": "No active media session"}
+        # WinRT TimeSpan is in 100-nanosecond ticks
+        ticks = int(position_seconds * 10_000_000)
+        ok = await asyncio.wait_for(session.try_change_playback_position_async(ticks), timeout=_SMTC_TIMEOUT)
+        return {"success": bool(ok), "position_seconds": position_seconds}
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "SMTC request timed out"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def smtc_set_shuffle(active: bool) -> Dict[str, Any]:
+    """
+    Enable or disable shuffle for the current media session via Windows SMTC.
+
+    Args:
+        active: True to enable shuffle, False to disable.
+
+    Returns:
+        Dict with success flag.
+    """
+    if not SMTC_AVAILABLE:
+        return _SMTC_NOT_AVAILABLE
+    try:
+        session = await _smtc_session()
+        if not session:
+            return {"success": False, "error": "No active media session"}
+        ok = await asyncio.wait_for(session.try_change_shuffle_active_async(active), timeout=_SMTC_TIMEOUT)
+        return {"success": bool(ok), "shuffle": active}
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "SMTC request timed out"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def smtc_set_repeat(mode: str) -> Dict[str, Any]:
+    """
+    Set the repeat mode for the current media session via Windows SMTC.
+
+    Args:
+        mode: One of "none" (no repeat), "track" (repeat current track),
+              or "list" (repeat the playlist/album).
+
+    Returns:
+        Dict with success flag.
+    """
+    if not SMTC_AVAILABLE:
+        return _SMTC_NOT_AVAILABLE
+    mode = mode.lower()
+    if mode not in _REPEAT_NAMES:
+        return {"success": False, "error": f"mode must be one of: {list(_REPEAT_NAMES)}"}
+    try:
+        session = await _smtc_session()
+        if not session:
+            return {"success": False, "error": "No active media session"}
+        repeat_value = _RepeatMode(int(_REPEAT_NAMES[mode]))
+        ok = await asyncio.wait_for(session.try_change_auto_repeat_mode_async(repeat_value), timeout=_SMTC_TIMEOUT)
+        return {"success": bool(ok), "repeat": mode}
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "SMTC request timed out"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 # MCP Resources
 @mcp.resource("deezer://api-endpoints")
 async def get_api_endpoints() -> str:
@@ -1015,11 +1294,21 @@ You are a music assistant with access to both the Deezer catalog and the user's 
 - lastfm_update_now_playing — push a now-playing status manually
 - lastfm_scrobble — submit a listen record
 
+## Windows SMTC — real-time playback control (Windows only)
+- smtc_get_now_playing — current track from any media app (Deezer, Spotify, browser, etc.)
+- smtc_play / smtc_pause / smtc_play_pause — playback control
+- smtc_next_track / smtc_previous_track — track navigation
+- smtc_seek — jump to a position (in seconds)
+- smtc_set_shuffle — enable/disable shuffle
+- smtc_set_repeat — set repeat mode (none / track / list)
+
 ## Workflow tips
-- Check what the user is playing with lastfm_get_now_playing, then use get_track_details or lastfm_get_similar_artists to go deeper
+- Use smtc_get_now_playing for real-time track info, lastfm_get_now_playing for scrobble-based history
+- smtc_get_now_playing → lastfm_get_similar_artists → search_tracks is a full discovery loop from current context
 - Use lastfm_get_top_artists to understand taste, then search Deezer for new releases by those artists
 - Combine lastfm_get_loved_tracks with advanced_search to find similar tracks by BPM or duration
 - Write operations (love, scrobble) require LASTFM_SESSION_KEY — tell the user to run lastfm_auth.py if not set
+- SMTC tools return success: false with a clear message if not on Windows or winrt not installed
 """
 
 

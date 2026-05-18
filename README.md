@@ -44,6 +44,24 @@ A Model Context Protocol (MCP) server combining the Deezer catalog with personal
 | `get_genre_artists` | Popular artists in a genre | genre_id, limit |
 | `get_chart` | Current music charts | genre_id (0=all), limit |
 
+### Windows SMTC Tools (Windows only)
+
+Controls whatever media app is currently active system-wide — Deezer, Spotify, browser, anything registered with Windows SMTC. No API key required; reads directly from the OS media session.
+
+| Tool | Description |
+|------|-------------|
+| `smtc_get_now_playing` | Current track: title, artist, album, position, duration, shuffle, repeat |
+| `smtc_play` | Resume playback |
+| `smtc_pause` | Pause playback |
+| `smtc_play_pause` | Toggle play/pause |
+| `smtc_next_track` | Skip to next track |
+| `smtc_previous_track` | Go to previous track |
+| `smtc_seek` | Seek to position (seconds) |
+| `smtc_set_shuffle` | Enable or disable shuffle |
+| `smtc_set_repeat` | Set repeat mode: `none`, `track`, or `list` |
+
+All SMTC tools return `{"success": false, "error": "..."}` gracefully on non-Windows systems or if the winrt package is not installed.
+
 ### Last.fm Tools
 
 | Tool | Auth needed | Description |
