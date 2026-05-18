@@ -1887,11 +1887,14 @@ def main():
 
     if transport == "stdio":
         mcp.run(transport="stdio")
-    elif transport in ("http", "streamable-http", "sse"):
+    elif transport in ("http", "streamable-http"):
         # stateless_http avoids the session initialization handshake that breaks
         # some clients (including AnythingLLM) which send requests before the
-        # MCP initialize round-trip completes on a persistent SSE session.
+        # MCP initialize round-trip completes on a persistent session.
         mcp.run(transport=transport, host=host, port=port, stateless_http=True)
+    elif transport == "sse":
+        # SSE keeps a persistent session and does not support stateless mode.
+        mcp.run(transport="sse", host=host, port=port)
     else:
         raise ValueError(f"Unsupported transport: {transport}")
 
