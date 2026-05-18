@@ -2,7 +2,7 @@
 Deezer MCP Server
 Provides search, retrieval, and exploration of music content via the Deezer API.
 Also integrates Last.fm for personalized listening data and track management,
-and Windows SMTC for real-time playback control and now-playing info.
+and cross-platform playback control (Windows SMTC, Linux MPRIS2, macOS osascript).
 """
 
 import asyncio
@@ -1166,24 +1166,45 @@ def _macos_control_sync(action: str, hint: str = "", value=None) -> dict:
         return {"success": False, "error": str(e)}
 
 
-# ── MPRIS / macOS tools ───────────────────────────────────────────────────────
+# ── Media control — unified cross-platform tools ──────────────────────────────
+# Windows → SMTC (winrt) · Linux → MPRIS2 (jeepney) · macOS → osascript
 
 _NOT_SUPPORTED = {
     "success": False,
-    "error": "Platform not supported. Use smtc_* tools on Windows.",
+    "error": "Media control is not supported on this platform.",
 }
+
+# ── SMTC helpers ─────────────────────────────────────────────────────────────
+
+_SMTC_NOT_AVAILABLE = {"success": False, "error": "SMTC requires Windows and: pip install winrt-Windows.Media.Control winrt-Windows.Media"}
+
+_PLAYBACK_STATUS = {0: "closed", 1: "opened", 2: "changing", 3: "stopped", 4: "playing", 5: "paused"}
+_REPEAT_NAMES = {"none": 0, "track": 1, "list": 2}
+_REPEAT_VALUES = {0: "none", 1: "track", 2: "list"}
+_SMTC_TIMEOUT = 5.0  # seconds before giving up on a WinRT async call
+
+
+async def _smtc_session():
+    """Return the current SMTC media session, or None if nothing is playing."""
+    manager = await asyncio.wait_for(_SMTCManager.request_async(), timeout=_SMTC_TIMEOUT)
+    return manager.get_current_session()
+
+
+# ── Unified playback control tools ───────────────────────────────────────────
 
 
 @mcp.tool()
-async def mpris_list_players(player: str = "") -> Dict[str, Any]:
+async def list_players(player: str = "") -> Dict[str, Any]:
     """
-    List all active media players available for control.
+    List available media players.
 
-    On Linux: returns MPRIS2 D-Bus services (any player supporting MPRIS2).
-    On macOS: returns which supported apps (Spotify, Music) are running.
+    On Linux returns MPRIS2-registered players (Spotify, VLC, Firefox, etc.).
+    On macOS returns which supported apps (Spotify, Music) are running.
+    On Windows, SMTC controls whatever app owns the system media session — no
+    per-player selection is needed, so this returns a fixed "system" entry.
 
     Returns:
-        Dict with list of player names.
+        Dict with a list of player names.
     """
     if sys.platform.startswith("linux"):
         if not MPRIS_AVAILABLE:
@@ -1198,31 +1219,64 @@ async def mpris_list_players(player: str = "") -> Dict[str, Any]:
         except Exception as e:
             return {"success": False, "error": str(e)}
     elif sys.platform == "darwin":
-        running = []
-        for app in _MACOS_APPS:
-            if _macos_detect_player(app):
-                running.append(app)
+        running = [app for app in _MACOS_APPS if _macos_detect_player(app)]
         return {"success": True, "players": running}
+    elif sys.platform == "win32":
+        return {"success": True, "players": ["system"],
+                "note": "SMTC controls the system-active media session — no per-player selection needed."}
     return _NOT_SUPPORTED
 
 
 @mcp.tool()
-async def mpris_get_now_playing(player: str = "") -> Dict[str, Any]:
+async def get_now_playing(player: str = "") -> Dict[str, Any]:
     """
-    Get the currently playing track via MPRIS2 (Linux) or osascript (macOS).
+    Get the currently playing track.
 
-    On Linux works with any MPRIS2-compliant player: Spotify, VLC, Rhythmbox,
-    Clementine, Firefox, Chromium, etc.
-    On macOS works with Spotify and Music (formerly iTunes).
+    Auto-selects the backend by platform:
+    - Windows: reads from SMTC (any app registered with System Media Transport Controls)
+    - Linux: reads from MPRIS2 via D-Bus (Spotify, VLC, Firefox, Chromium, etc.)
+    - macOS: reads via osascript (Spotify or Music)
 
     Args:
-        player: Player name hint (e.g. "spotify", "vlc"). Defaults to the first
-                active player found.
+        player: Player name hint for Linux/macOS (e.g. "spotify", "vlc").
+                Ignored on Windows — SMTC always reads the system-active session.
 
     Returns:
-        Dict with title, artist, album, status, position, duration, shuffle, repeat.
+        Dict with title, artist, album, playback status, position, duration,
+        shuffle state, and repeat mode.
     """
-    if sys.platform.startswith("linux"):
+    if sys.platform == "win32":
+        if not SMTC_AVAILABLE:
+            return _SMTC_NOT_AVAILABLE
+        try:
+            session = await _smtc_session()
+            if not session:
+                return {"success": True, "playing": False, "track": None}
+            props = await asyncio.wait_for(session.try_get_media_properties_async(), timeout=_SMTC_TIMEOUT)
+            playback = session.get_playback_info()
+            timeline = session.get_timeline_properties()
+            status_int = int(playback.playback_status)
+            return {
+                "success": True,
+                "playing": status_int == 4,
+                "track": {
+                    "title": props.title,
+                    "artist": props.artist,
+                    "album": props.album_title,
+                    "track_number": props.track_number,
+                    "status": _PLAYBACK_STATUS.get(status_int, "unknown"),
+                    "position_seconds": round(timeline.position.total_seconds()),
+                    "duration_seconds": round(timeline.end_time.total_seconds()),
+                    "shuffle": playback.is_shuffle_active,
+                    "repeat": _REPEAT_VALUES.get(int(playback.auto_repeat_mode), "unknown"),
+                    "source_app": session.source_app_user_model_id,
+                },
+            }
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "SMTC request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform.startswith("linux"):
         if not MPRIS_AVAILABLE:
             return {"success": False, "error": "Install jeepney: pip install jeepney"}
         try:
@@ -1230,10 +1284,8 @@ async def mpris_get_now_playing(player: str = "") -> Dict[str, Any]:
                 service = await asyncio.wait_for(_mpris_resolve(router, player), _MPRIS_TIMEOUT)
                 if not service:
                     services = await _mpris_list_services(router)
-                    if services:
-                        hint = f"Available: {[s.removeprefix(_MPRIS_PREFIX) for s in services]}"
-                    else:
-                        hint = "No MPRIS players are running"
+                    hint = (f"Available: {[s.removeprefix(_MPRIS_PREFIX) for s in services]}"
+                            if services else "No MPRIS players are running")
                     return {"success": False, "error": hint}
                 props = await asyncio.wait_for(_mpris_get_props(router, service), _MPRIS_TIMEOUT)
             track = _mpris_extract_track(props)
@@ -1253,17 +1305,30 @@ async def mpris_get_now_playing(player: str = "") -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def mpris_play(player: str = "") -> Dict[str, Any]:
+async def play(player: str = "") -> Dict[str, Any]:
     """
-    Resume playback via MPRIS2 (Linux) or osascript (macOS).
+    Resume playback.
 
     Args:
-        player: Player name hint. Defaults to the first active player.
+        player: Player name hint for Linux/macOS. Ignored on Windows.
 
     Returns:
         Dict with success flag.
     """
-    if sys.platform.startswith("linux"):
+    if sys.platform == "win32":
+        if not SMTC_AVAILABLE:
+            return _SMTC_NOT_AVAILABLE
+        try:
+            session = await _smtc_session()
+            if not session:
+                return {"success": False, "error": "No active media session"}
+            ok = await asyncio.wait_for(session.try_play_async(), timeout=_SMTC_TIMEOUT)
+            return {"success": bool(ok)}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "SMTC request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform.startswith("linux"):
         if not MPRIS_AVAILABLE:
             return {"success": False, "error": "Install jeepney: pip install jeepney"}
         try:
@@ -1283,14 +1348,30 @@ async def mpris_play(player: str = "") -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def mpris_pause(player: str = "") -> Dict[str, Any]:
+async def pause(player: str = "") -> Dict[str, Any]:
     """
-    Pause playback via MPRIS2 (Linux) or osascript (macOS).
+    Pause playback.
 
     Args:
-        player: Player name hint. Defaults to the first active player.
+        player: Player name hint for Linux/macOS. Ignored on Windows.
+
+    Returns:
+        Dict with success flag.
     """
-    if sys.platform.startswith("linux"):
+    if sys.platform == "win32":
+        if not SMTC_AVAILABLE:
+            return _SMTC_NOT_AVAILABLE
+        try:
+            session = await _smtc_session()
+            if not session:
+                return {"success": False, "error": "No active media session"}
+            ok = await asyncio.wait_for(session.try_pause_async(), timeout=_SMTC_TIMEOUT)
+            return {"success": bool(ok)}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "SMTC request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform.startswith("linux"):
         if not MPRIS_AVAILABLE:
             return {"success": False, "error": "Install jeepney: pip install jeepney"}
         try:
@@ -1310,14 +1391,37 @@ async def mpris_pause(player: str = "") -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def mpris_play_pause(player: str = "") -> Dict[str, Any]:
+async def play_pause(player: str = "") -> Dict[str, Any]:
     """
-    Toggle play/pause via MPRIS2 (Linux) or osascript (macOS).
+    Toggle play/pause.
 
     Args:
-        player: Player name hint. Defaults to the first active player.
+        player: Player name hint for Linux/macOS. Ignored on Windows.
+
+    Returns:
+        Dict with success flag.
     """
-    if sys.platform.startswith("linux"):
+    if sys.platform == "win32":
+        if not SMTC_AVAILABLE:
+            return _SMTC_NOT_AVAILABLE
+        try:
+            session = await _smtc_session()
+            if not session:
+                return {"success": False, "error": "No active media session"}
+            playback = session.get_playback_info()
+            is_playing = int(playback.playback_status) == 4
+            if is_playing:
+                ok = await asyncio.wait_for(session.try_pause_async(), timeout=_SMTC_TIMEOUT)
+                new_state = "paused"
+            else:
+                ok = await asyncio.wait_for(session.try_play_async(), timeout=_SMTC_TIMEOUT)
+                new_state = "playing"
+            return {"success": bool(ok), "state": new_state}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "SMTC request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform.startswith("linux"):
         if not MPRIS_AVAILABLE:
             return {"success": False, "error": "Install jeepney: pip install jeepney"}
         try:
@@ -1337,14 +1441,30 @@ async def mpris_play_pause(player: str = "") -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def mpris_next_track(player: str = "") -> Dict[str, Any]:
+async def next_track(player: str = "") -> Dict[str, Any]:
     """
-    Skip to the next track via MPRIS2 (Linux) or osascript (macOS).
+    Skip to the next track.
 
     Args:
-        player: Player name hint. Defaults to the first active player.
+        player: Player name hint for Linux/macOS. Ignored on Windows.
+
+    Returns:
+        Dict with success flag.
     """
-    if sys.platform.startswith("linux"):
+    if sys.platform == "win32":
+        if not SMTC_AVAILABLE:
+            return _SMTC_NOT_AVAILABLE
+        try:
+            session = await _smtc_session()
+            if not session:
+                return {"success": False, "error": "No active media session"}
+            ok = await asyncio.wait_for(session.try_skip_next_async(), timeout=_SMTC_TIMEOUT)
+            return {"success": bool(ok)}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "SMTC request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform.startswith("linux"):
         if not MPRIS_AVAILABLE:
             return {"success": False, "error": "Install jeepney: pip install jeepney"}
         try:
@@ -1364,14 +1484,30 @@ async def mpris_next_track(player: str = "") -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def mpris_previous_track(player: str = "") -> Dict[str, Any]:
+async def previous_track(player: str = "") -> Dict[str, Any]:
     """
-    Go to the previous track via MPRIS2 (Linux) or osascript (macOS).
+    Go to the previous track.
 
     Args:
-        player: Player name hint. Defaults to the first active player.
+        player: Player name hint for Linux/macOS. Ignored on Windows.
+
+    Returns:
+        Dict with success flag.
     """
-    if sys.platform.startswith("linux"):
+    if sys.platform == "win32":
+        if not SMTC_AVAILABLE:
+            return _SMTC_NOT_AVAILABLE
+        try:
+            session = await _smtc_session()
+            if not session:
+                return {"success": False, "error": "No active media session"}
+            ok = await asyncio.wait_for(session.try_skip_previous_async(), timeout=_SMTC_TIMEOUT)
+            return {"success": bool(ok)}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "SMTC request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform.startswith("linux"):
         if not MPRIS_AVAILABLE:
             return {"success": False, "error": "Install jeepney: pip install jeepney"}
         try:
@@ -1391,18 +1527,32 @@ async def mpris_previous_track(player: str = "") -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def mpris_seek(position_seconds: float, player: str = "") -> Dict[str, Any]:
+async def seek(position_seconds: float, player: str = "") -> Dict[str, Any]:
     """
     Seek to an absolute position in the current track.
 
-    On Linux uses MPRIS2 SetPosition (absolute, in microseconds).
-    On macOS uses AppleScript player position (absolute, in seconds).
-
     Args:
         position_seconds: Target position in seconds from the start of the track.
-        player: Player name hint. Defaults to the first active player.
+        player: Player name hint for Linux/macOS. Ignored on Windows.
+
+    Returns:
+        Dict with success flag and the position seeked to.
     """
-    if sys.platform.startswith("linux"):
+    if sys.platform == "win32":
+        if not SMTC_AVAILABLE:
+            return _SMTC_NOT_AVAILABLE
+        try:
+            session = await _smtc_session()
+            if not session:
+                return {"success": False, "error": "No active media session"}
+            ticks = int(position_seconds * 10_000_000)  # WinRT TimeSpan in 100-ns ticks
+            ok = await asyncio.wait_for(session.try_change_playback_position_async(ticks), timeout=_SMTC_TIMEOUT)
+            return {"success": bool(ok), "position_seconds": position_seconds}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "SMTC request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform.startswith("linux"):
         if not MPRIS_AVAILABLE:
             return {"success": False, "error": "Install jeepney: pip install jeepney"}
         try:
@@ -1429,18 +1579,31 @@ async def mpris_seek(position_seconds: float, player: str = "") -> Dict[str, Any
 
 
 @mcp.tool()
-async def mpris_set_shuffle(active: bool, player: str = "") -> Dict[str, Any]:
+async def set_shuffle(active: bool, player: str = "") -> Dict[str, Any]:
     """
     Enable or disable shuffle.
 
-    On Linux sets the MPRIS2 Shuffle property.
-    On macOS uses AppleScript (Spotify: shuffling, Music: shuffle enabled).
-
     Args:
         active: True to enable shuffle, False to disable.
-        player: Player name hint. Defaults to the first active player.
+        player: Player name hint for Linux/macOS. Ignored on Windows.
+
+    Returns:
+        Dict with success flag.
     """
-    if sys.platform.startswith("linux"):
+    if sys.platform == "win32":
+        if not SMTC_AVAILABLE:
+            return _SMTC_NOT_AVAILABLE
+        try:
+            session = await _smtc_session()
+            if not session:
+                return {"success": False, "error": "No active media session"}
+            ok = await asyncio.wait_for(session.try_change_shuffle_active_async(active), timeout=_SMTC_TIMEOUT)
+            return {"success": bool(ok), "shuffle": active}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "SMTC request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform.startswith("linux"):
         if not MPRIS_AVAILABLE:
             return {"success": False, "error": "Install jeepney: pip install jeepney"}
         try:
@@ -1464,21 +1627,35 @@ async def mpris_set_shuffle(active: bool, player: str = "") -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def mpris_set_repeat(mode: str, player: str = "") -> Dict[str, Any]:
+async def set_repeat(mode: str, player: str = "") -> Dict[str, Any]:
     """
     Set the repeat mode.
 
-    On Linux sets the MPRIS2 LoopStatus property.
-    On macOS uses AppleScript (note: Spotify does not distinguish track vs list repeat).
-
     Args:
         mode: One of "none", "track", or "list".
-        player: Player name hint. Defaults to the first active player.
+        player: Player name hint for Linux/macOS. Ignored on Windows.
+
+    Returns:
+        Dict with success flag.
     """
     mode = mode.lower()
     if mode not in _MPRIS_REPEAT_MAP:
         return {"success": False, "error": f"mode must be one of: {list(_MPRIS_REPEAT_MAP)}"}
-    if sys.platform.startswith("linux"):
+    if sys.platform == "win32":
+        if not SMTC_AVAILABLE:
+            return _SMTC_NOT_AVAILABLE
+        try:
+            session = await _smtc_session()
+            if not session:
+                return {"success": False, "error": "No active media session"}
+            repeat_value = _RepeatMode(int(_REPEAT_NAMES[mode]))
+            ok = await asyncio.wait_for(session.try_change_auto_repeat_mode_async(repeat_value), timeout=_SMTC_TIMEOUT)
+            return {"success": bool(ok), "repeat": mode}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "SMTC request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform.startswith("linux"):
         if not MPRIS_AVAILABLE:
             return {"success": False, "error": "Install jeepney: pip install jeepney"}
         try:
@@ -1500,271 +1677,6 @@ async def mpris_set_repeat(mode: str, player: str = "") -> Dict[str, Any]:
         action = f"repeat_{mode}"
         return await asyncio.to_thread(_macos_control_sync, action, player)
     return _NOT_SUPPORTED
-
-
-# ── SMTC helpers ─────────────────────────────────────────────────────────────
-
-_SMTC_NOT_AVAILABLE = {"success": False, "error": "SMTC requires Windows and: pip install winrt-Windows.Media.Control winrt-Windows.Media"}
-
-_PLAYBACK_STATUS = {0: "closed", 1: "opened", 2: "changing", 3: "stopped", 4: "playing", 5: "paused"}
-_REPEAT_NAMES = {"none": 0, "track": 1, "list": 2}
-_REPEAT_VALUES = {0: "none", 1: "track", 2: "list"}
-_SMTC_TIMEOUT = 5.0  # seconds before giving up on a WinRT async call
-
-
-async def _smtc_session():
-    """Return the current SMTC media session, or None if nothing is playing."""
-    manager = await asyncio.wait_for(_SMTCManager.request_async(), timeout=_SMTC_TIMEOUT)
-    return manager.get_current_session()
-
-
-# ── SMTC read tools ───────────────────────────────────────────────────────────
-
-@mcp.tool()
-async def smtc_get_now_playing() -> Dict[str, Any]:
-    """
-    Get the track currently playing on this Windows machine via System Media Transport Controls.
-
-    Works with any media app that registers with SMTC: Deezer, Spotify, browser,
-    Windows Media Player, etc.
-
-    Returns:
-        Dict with title, artist, album, playback status, position, duration,
-        shuffle state, repeat mode, and the source application name.
-    """
-    if not SMTC_AVAILABLE:
-        return _SMTC_NOT_AVAILABLE
-    try:
-        session = await _smtc_session()
-        if not session:
-            return {"success": True, "playing": False, "track": None}
-
-        props = await asyncio.wait_for(session.try_get_media_properties_async(), timeout=_SMTC_TIMEOUT)
-        playback = session.get_playback_info()
-        timeline = session.get_timeline_properties()
-
-        status_int = int(playback.playback_status)
-        return {
-            "success": True,
-            "playing": status_int == 4,
-            "track": {
-                "title": props.title,
-                "artist": props.artist,
-                "album": props.album_title,
-                "track_number": props.track_number,
-                "status": _PLAYBACK_STATUS.get(status_int, "unknown"),
-                "position_seconds": round(timeline.position.total_seconds()),
-                "duration_seconds": round(timeline.end_time.total_seconds()),
-                "shuffle": playback.is_shuffle_active,
-                "repeat": _REPEAT_VALUES.get(int(playback.auto_repeat_mode), "unknown"),
-                "source_app": session.source_app_user_model_id,
-            },
-        }
-    except asyncio.TimeoutError:
-        return {"success": False, "error": "SMTC request timed out"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-# ── SMTC playback control tools ───────────────────────────────────────────────
-
-@mcp.tool()
-async def smtc_play() -> Dict[str, Any]:
-    """
-    Resume playback of the current media session via Windows SMTC.
-
-    Returns:
-        Dict with success flag. False if no session is active or the app rejected the command.
-    """
-    if not SMTC_AVAILABLE:
-        return _SMTC_NOT_AVAILABLE
-    try:
-        session = await _smtc_session()
-        if not session:
-            return {"success": False, "error": "No active media session"}
-        ok = await asyncio.wait_for(session.try_play_async(), timeout=_SMTC_TIMEOUT)
-        return {"success": bool(ok)}
-    except asyncio.TimeoutError:
-        return {"success": False, "error": "SMTC request timed out"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def smtc_pause() -> Dict[str, Any]:
-    """
-    Pause playback of the current media session via Windows SMTC.
-
-    Returns:
-        Dict with success flag.
-    """
-    if not SMTC_AVAILABLE:
-        return _SMTC_NOT_AVAILABLE
-    try:
-        session = await _smtc_session()
-        if not session:
-            return {"success": False, "error": "No active media session"}
-        ok = await asyncio.wait_for(session.try_pause_async(), timeout=_SMTC_TIMEOUT)
-        return {"success": bool(ok)}
-    except asyncio.TimeoutError:
-        return {"success": False, "error": "SMTC request timed out"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def smtc_play_pause() -> Dict[str, Any]:
-    """
-    Toggle play/pause for the current media session via Windows SMTC.
-
-    Returns:
-        Dict with success flag and the new playback state.
-    """
-    if not SMTC_AVAILABLE:
-        return _SMTC_NOT_AVAILABLE
-    try:
-        session = await _smtc_session()
-        if not session:
-            return {"success": False, "error": "No active media session"}
-        playback = session.get_playback_info()
-        is_playing = int(playback.playback_status) == 4
-        if is_playing:
-            ok = await asyncio.wait_for(session.try_pause_async(), timeout=_SMTC_TIMEOUT)
-            new_state = "paused"
-        else:
-            ok = await asyncio.wait_for(session.try_play_async(), timeout=_SMTC_TIMEOUT)
-            new_state = "playing"
-        return {"success": bool(ok), "state": new_state}
-    except asyncio.TimeoutError:
-        return {"success": False, "error": "SMTC request timed out"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def smtc_next_track() -> Dict[str, Any]:
-    """
-    Skip to the next track in the current media session via Windows SMTC.
-
-    Returns:
-        Dict with success flag.
-    """
-    if not SMTC_AVAILABLE:
-        return _SMTC_NOT_AVAILABLE
-    try:
-        session = await _smtc_session()
-        if not session:
-            return {"success": False, "error": "No active media session"}
-        ok = await asyncio.wait_for(session.try_skip_next_async(), timeout=_SMTC_TIMEOUT)
-        return {"success": bool(ok)}
-    except asyncio.TimeoutError:
-        return {"success": False, "error": "SMTC request timed out"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def smtc_previous_track() -> Dict[str, Any]:
-    """
-    Go to the previous track in the current media session via Windows SMTC.
-
-    Returns:
-        Dict with success flag.
-    """
-    if not SMTC_AVAILABLE:
-        return _SMTC_NOT_AVAILABLE
-    try:
-        session = await _smtc_session()
-        if not session:
-            return {"success": False, "error": "No active media session"}
-        ok = await asyncio.wait_for(session.try_skip_previous_async(), timeout=_SMTC_TIMEOUT)
-        return {"success": bool(ok)}
-    except asyncio.TimeoutError:
-        return {"success": False, "error": "SMTC request timed out"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def smtc_seek(position_seconds: float) -> Dict[str, Any]:
-    """
-    Seek to a specific position in the currently playing track via Windows SMTC.
-
-    Args:
-        position_seconds: Target position in seconds from the start of the track.
-
-    Returns:
-        Dict with success flag.
-    """
-    if not SMTC_AVAILABLE:
-        return _SMTC_NOT_AVAILABLE
-    try:
-        session = await _smtc_session()
-        if not session:
-            return {"success": False, "error": "No active media session"}
-        # WinRT TimeSpan is in 100-nanosecond ticks
-        ticks = int(position_seconds * 10_000_000)
-        ok = await asyncio.wait_for(session.try_change_playback_position_async(ticks), timeout=_SMTC_TIMEOUT)
-        return {"success": bool(ok), "position_seconds": position_seconds}
-    except asyncio.TimeoutError:
-        return {"success": False, "error": "SMTC request timed out"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def smtc_set_shuffle(active: bool) -> Dict[str, Any]:
-    """
-    Enable or disable shuffle for the current media session via Windows SMTC.
-
-    Args:
-        active: True to enable shuffle, False to disable.
-
-    Returns:
-        Dict with success flag.
-    """
-    if not SMTC_AVAILABLE:
-        return _SMTC_NOT_AVAILABLE
-    try:
-        session = await _smtc_session()
-        if not session:
-            return {"success": False, "error": "No active media session"}
-        ok = await asyncio.wait_for(session.try_change_shuffle_active_async(active), timeout=_SMTC_TIMEOUT)
-        return {"success": bool(ok), "shuffle": active}
-    except asyncio.TimeoutError:
-        return {"success": False, "error": "SMTC request timed out"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def smtc_set_repeat(mode: str) -> Dict[str, Any]:
-    """
-    Set the repeat mode for the current media session via Windows SMTC.
-
-    Args:
-        mode: One of "none" (no repeat), "track" (repeat current track),
-              or "list" (repeat the playlist/album).
-
-    Returns:
-        Dict with success flag.
-    """
-    if not SMTC_AVAILABLE:
-        return _SMTC_NOT_AVAILABLE
-    mode = mode.lower()
-    if mode not in _REPEAT_NAMES:
-        return {"success": False, "error": f"mode must be one of: {list(_REPEAT_NAMES)}"}
-    try:
-        session = await _smtc_session()
-        if not session:
-            return {"success": False, "error": "No active media session"}
-        repeat_value = _RepeatMode(int(_REPEAT_NAMES[mode]))
-        ok = await asyncio.wait_for(session.try_change_auto_repeat_mode_async(repeat_value), timeout=_SMTC_TIMEOUT)
-        return {"success": bool(ok), "repeat": mode}
-    except asyncio.TimeoutError:
-        return {"success": False, "error": "SMTC request timed out"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
 
 # MCP Resources
@@ -1853,30 +1765,26 @@ You are a music assistant with access to both the Deezer catalog and the user's 
 - lastfm_update_now_playing — push a now-playing status manually
 - lastfm_scrobble — submit a listen record
 
-## Linux MPRIS2 / macOS osascript — cross-platform playback control
-- mpris_list_players — list active players (Linux: any MPRIS2 app; macOS: Spotify/Music)
-- mpris_get_now_playing — current track info
-- mpris_play / mpris_pause / mpris_play_pause — playback control
-- mpris_next_track / mpris_previous_track — track navigation
-- mpris_seek — jump to position in seconds
-- mpris_set_shuffle — enable/disable shuffle
-- mpris_set_repeat — set repeat mode (none / track / list)
+## Playback control — auto-selects backend by platform
+Works on Windows (SMTC), Linux (MPRIS2), and macOS (osascript). The `player`
+parameter is accepted everywhere but only used on Linux/macOS to pick a specific
+app; on Windows SMTC always controls the system-active session.
 
-## Windows SMTC — real-time playback control (Windows only)
-- smtc_get_now_playing — current track from any media app (Deezer, Spotify, browser, etc.)
-- smtc_play / smtc_pause / smtc_play_pause — playback control
-- smtc_next_track / smtc_previous_track — track navigation
-- smtc_seek — jump to a position (in seconds)
-- smtc_set_shuffle — enable/disable shuffle
-- smtc_set_repeat — set repeat mode (none / track / list)
+- list_players — list available media players
+- get_now_playing — current track: title, artist, album, status, position, duration, shuffle, repeat
+- play / pause / play_pause — playback control
+- next_track / previous_track — track navigation
+- seek — jump to absolute position in seconds
+- set_shuffle — enable/disable shuffle
+- set_repeat — set repeat mode (none / track / list)
 
 ## Workflow tips
-- Use smtc_get_now_playing for real-time track info, lastfm_get_now_playing for scrobble-based history
-- smtc_get_now_playing → lastfm_get_similar_artists → search_tracks is a full discovery loop from current context
+- Use get_now_playing for real-time track info; lastfm_get_now_playing for scrobble-based history
+- get_now_playing → lastfm_get_similar_artists → search_tracks is a full discovery loop from current context
 - Use lastfm_get_top_artists to understand taste, then search Deezer for new releases by those artists
 - Combine lastfm_get_loved_tracks with advanced_search to find similar tracks by BPM or duration
 - Write operations (love, scrobble) require LASTFM_SESSION_KEY — tell the user to run lastfm_auth.py if not set
-- SMTC tools return success: false with a clear message if not on Windows or winrt not installed
+- Playback tools return success: false with a clear error if the platform backend is unavailable
 """
 
 

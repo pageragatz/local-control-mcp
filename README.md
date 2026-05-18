@@ -44,23 +44,29 @@ A Model Context Protocol (MCP) server combining the Deezer catalog with personal
 | `get_genre_artists` | Popular artists in a genre | genre_id, limit |
 | `get_chart` | Current music charts | genre_id (0=all), limit |
 
-### Windows SMTC Tools (Windows only)
+### Playback Control Tools
 
-Controls whatever media app is currently active system-wide — Deezer, Spotify, browser, anything registered with Windows SMTC. No API key required; reads directly from the OS media session.
+Cross-platform playback control that auto-selects the backend based on OS:
+- **Windows**: System Media Transport Controls (SMTC) — controls any app registered with the OS media session (Deezer, Spotify, browser, etc.)
+- **Linux**: MPRIS2 via D-Bus (jeepney) — works with Spotify, VLC, Firefox, Chromium, Rhythmbox, etc.
+- **macOS**: osascript — works with Spotify and Music (no extra packages required)
 
-| Tool | Description |
-|------|-------------|
-| `smtc_get_now_playing` | Current track: title, artist, album, position, duration, shuffle, repeat |
-| `smtc_play` | Resume playback |
-| `smtc_pause` | Pause playback |
-| `smtc_play_pause` | Toggle play/pause |
-| `smtc_next_track` | Skip to next track |
-| `smtc_previous_track` | Go to previous track |
-| `smtc_seek` | Seek to position (seconds) |
-| `smtc_set_shuffle` | Enable or disable shuffle |
-| `smtc_set_repeat` | Set repeat mode: `none`, `track`, or `list` |
+The `player` parameter is accepted by all tools but only used on Linux/macOS to select a specific app. On Windows it is silently ignored — SMTC always targets the system-active session.
 
-All SMTC tools return `{"success": false, "error": "..."}` gracefully on non-Windows systems or if the winrt package is not installed.
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `list_players` | List active media players | — |
+| `get_now_playing` | Current track: title, artist, album, position, duration, shuffle, repeat | player |
+| `play` | Resume playback | player |
+| `pause` | Pause playback | player |
+| `play_pause` | Toggle play/pause | player |
+| `next_track` | Skip to next track | player |
+| `previous_track` | Go to previous track | player |
+| `seek` | Seek to position (seconds) | position_seconds, player |
+| `set_shuffle` | Enable or disable shuffle | active, player |
+| `set_repeat` | Set repeat mode: `none`, `track`, or `list` | mode, player |
+
+All tools return `{"success": false, "error": "..."}` gracefully when the platform backend is unavailable.
 
 ### Last.fm Tools
 
