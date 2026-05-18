@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import subprocess
 import sys
 import time
 from typing import Dict, Any, Optional
@@ -23,8 +24,17 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Windows SMTC optional import ─────────────────────────────────────────────
-SMTC_AVAILABLE = False
+# ── Linux MPRIS optional import (jeepney — pure Python, no system headers) ───
+MPRIS_AVAILABLE = False
+if sys.platform.startswith("linux"):
+    try:
+        from jeepney import DBusAddress, new_method_call
+        from jeepney.io.asyncio import open_dbus_router
+        MPRIS_AVAILABLE = True
+    except ImportError:
+        logger.warning("jeepney not installed — MPRIS tools unavailable. Run: pip install jeepney")
+
+# ── Windows SMTC optional import ─────────────────────────────────────────────SMTC_AVAILABLE = False
 if sys.platform == "win32":
     try:
         from winrt.windows.media.control import (
@@ -943,6 +953,555 @@ async def lastfm_update_now_playing(artist: str, track: str, album: str = "", du
             return {"success": False, "error": str(e)}
 
 
+# ── MPRIS / macOS media helpers ───────────────────────────────────────────────
+
+_MPRIS_PREFIX = "org.mpris.MediaPlayer2."
+_MPRIS_OBJ = "/org/mpris/MediaPlayer2"
+_PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
+_PROPS_IFACE = "org.freedesktop.DBus.Properties"
+_MPRIS_LOOP_MAP = {"None": "none", "Track": "track", "Playlist": "list"}
+_MPRIS_REPEAT_MAP = {"none": "None", "track": "Track", "list": "Playlist"}
+_MPRIS_TIMEOUT = 5.0
+
+
+def _mpris_addr(bus_name: str, interface: str) -> "DBusAddress":
+    return DBusAddress(_MPRIS_OBJ, bus_name=bus_name, interface=interface)
+
+
+async def _mpris_list_services(router) -> list:
+    msg = new_method_call(
+        DBusAddress("/org/freedesktop/DBus", bus_name="org.freedesktop.DBus",
+                    interface="org.freedesktop.DBus"),
+        "ListNames",
+    )
+    reply = await router.send_and_get_reply(msg)
+    return [n for n in reply.body[0] if n.startswith(_MPRIS_PREFIX)]
+
+
+async def _mpris_resolve(router, hint: str = "") -> str | None:
+    services = await _mpris_list_services(router)
+    if not services:
+        return None
+    if not hint:
+        return services[0]
+    full = hint if hint.startswith(_MPRIS_PREFIX) else f"{_MPRIS_PREFIX}{hint}"
+    matched = [s for s in services if s == full]
+    return matched[0] if matched else None
+
+
+async def _mpris_get_props(router, service: str) -> dict:
+    msg = new_method_call(
+        _mpris_addr(service, _PROPS_IFACE),
+        "GetAll",
+        signature="s",
+        body=(_PLAYER_IFACE,),
+    )
+    reply = await router.send_and_get_reply(msg)
+    return dict(reply.body[0])
+
+
+async def _mpris_call(router, service: str, method: str, signature=None, body=()):
+    msg = new_method_call(_mpris_addr(service, _PLAYER_IFACE), method,
+                          signature=signature, body=body)
+    return await router.send_and_get_reply(msg)
+
+
+async def _mpris_set(router, service: str, prop: str, type_sig: str, value):
+    # D-Bus variant is represented as (type_signature, value) in jeepney
+    msg = new_method_call(
+        _mpris_addr(service, _PROPS_IFACE),
+        "Set",
+        signature="ssv",
+        body=(_PLAYER_IFACE, prop, (type_sig, value)),
+    )
+    return await router.send_and_get_reply(msg)
+
+
+def _mpris_extract_track(props: dict) -> dict:
+    meta = dict(props.get("Metadata", {}))
+    artists = list(meta.get("xesam:artist", []))
+    length_us = int(meta.get("mpris:length", 0))
+    pos_us = int(props.get("Position", 0))
+    loop = str(props.get("LoopStatus", "None"))
+    status = str(props.get("PlaybackStatus", "Stopped"))
+    return {
+        "title": str(meta.get("xesam:title", "")),
+        "artist": ", ".join(str(a) for a in artists),
+        "album": str(meta.get("xesam:album", "")),
+        "status": status.lower(),
+        "position_seconds": round(pos_us / 1_000_000),
+        "duration_seconds": round(length_us / 1_000_000),
+        "shuffle": bool(props.get("Shuffle", False)),
+        "repeat": _MPRIS_LOOP_MAP.get(loop, "none"),
+        "track_id": str(meta.get("mpris:trackid", "")),
+    }
+
+
+# ── macOS helpers (osascript) ─────────────────────────────────────────────────
+
+_MACOS_APPS = ["Spotify", "Music"]
+
+
+def _osa(script: str) -> str:
+    """Run an AppleScript fragment, return stdout stripped."""
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True, text=True, timeout=5,
+    )
+    return result.stdout.strip()
+
+
+def _macos_detect_player(hint: str = "") -> str | None:
+    """Return the first MPRIS-like macOS app that is running, or None."""
+    candidates = [hint] if hint else _MACOS_APPS
+    for app in candidates:
+        running = _osa(
+            f'tell application "System Events" to '
+            f'count (processes where name is "{app}")'
+        )
+        if running == "1":
+            return app
+    return None
+
+
+def _macos_now_playing_sync(hint: str = "") -> dict:
+    app = _macos_detect_player(hint)
+    if not app:
+        return {"success": True, "playing": False, "track": None,
+                "note": f"No supported player running. Tried: {_MACOS_APPS}"}
+    if app == "Spotify":
+        script = f'''
+        tell application "Spotify"
+            set s to player state as string
+            if s is "playing" or s is "paused" then
+                set t to name of current track
+                set ar to artist of current track
+                set al to album of current track
+                set pos to player position
+                set dur to duration of current track / 1000
+                set sh to shuffling as string
+                return s & "|||" & t & "|||" & ar & "|||" & al & "|||" & pos & "|||" & dur & "|||" & sh
+            end if
+        end tell
+        '''
+    else:  # Music / iTunes
+        script = f'''
+        tell application "{app}"
+            set s to player state as string
+            if s is "playing" or s is "paused" then
+                set t to name of current track
+                set ar to artist of current track
+                set al to album of current track
+                set pos to player position
+                set dur to duration of current track
+                set sh to shuffle enabled as string
+                return s & "|||" & t & "|||" & ar & "|||" & al & "|||" & pos & "|||" & dur & "|||" & sh
+            end if
+        end tell
+        '''
+    raw = _osa(script)
+    if not raw or "|||" not in raw:
+        return {"success": True, "playing": False, "track": None}
+    parts = raw.split("|||")
+    status = parts[0].strip()
+    return {
+        "success": True,
+        "playing": status == "playing",
+        "player": app,
+        "track": {
+            "title": parts[1].strip() if len(parts) > 1 else "",
+            "artist": parts[2].strip() if len(parts) > 2 else "",
+            "album": parts[3].strip() if len(parts) > 3 else "",
+            "status": status,
+            "position_seconds": round(float(parts[4])) if len(parts) > 4 else 0,
+            "duration_seconds": round(float(parts[5])) if len(parts) > 5 else 0,
+            "shuffle": parts[6].strip() == "true" if len(parts) > 6 else False,
+            "repeat": "unknown",
+        },
+    }
+
+
+def _macos_control_sync(action: str, hint: str = "", value=None) -> dict:
+    app = _macos_detect_player(hint)
+    if not app:
+        return {"success": False, "error": f"No supported player running. Tried: {_MACOS_APPS}"}
+
+    if app == "Spotify":
+        scripts = {
+            "play": 'tell application "Spotify" to play',
+            "pause": 'tell application "Spotify" to pause',
+            "play_pause": 'tell application "Spotify" to playpause',
+            "next": 'tell application "Spotify" to next track',
+            "previous": 'tell application "Spotify" to previous track',
+            "seek": f'tell application "Spotify" to set player position to {value}',
+            "shuffle_on": 'tell application "Spotify" to set shuffling to true',
+            "shuffle_off": 'tell application "Spotify" to set shuffling to false',
+            "repeat_none": 'tell application "Spotify" to set repeating to false',
+            "repeat_track": 'tell application "Spotify" to set repeating to true',
+            "repeat_list": 'tell application "Spotify" to set repeating to true',
+        }
+    else:
+        scripts = {
+            "play": f'tell application "{app}" to play',
+            "pause": f'tell application "{app}" to pause',
+            "play_pause": f'tell application "{app}" to playpause',
+            "next": f'tell application "{app}" to next track',
+            "previous": f'tell application "{app}" to back track',
+            "seek": f'tell application "{app}" to set player position to {value}',
+            "shuffle_on": f'tell application "{app}" to set shuffle enabled to true',
+            "shuffle_off": f'tell application "{app}" to set shuffle enabled to false',
+            "repeat_none": f'tell application "{app}" to set song repeat to off',
+            "repeat_track": f'tell application "{app}" to set song repeat to one',
+            "repeat_list": f'tell application "{app}" to set song repeat to all',
+        }
+    script = scripts.get(action)
+    if not script:
+        return {"success": False, "error": f"Unknown action: {action}"}
+    try:
+        _osa(script)
+        return {"success": True}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "osascript timed out"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ── MPRIS / macOS tools ───────────────────────────────────────────────────────
+
+_NOT_SUPPORTED = {
+    "success": False,
+    "error": "Platform not supported. Use smtc_* tools on Windows.",
+}
+
+
+@mcp.tool()
+async def mpris_list_players(player: str = "") -> Dict[str, Any]:
+    """
+    List all active media players available for control.
+
+    On Linux: returns MPRIS2 D-Bus services (any player supporting MPRIS2).
+    On macOS: returns which supported apps (Spotify, Music) are running.
+
+    Returns:
+        Dict with list of player names.
+    """
+    if sys.platform.startswith("linux"):
+        if not MPRIS_AVAILABLE:
+            return {"success": False, "error": "Install jeepney: pip install jeepney"}
+        try:
+            async with open_dbus_router() as router:
+                services = await asyncio.wait_for(_mpris_list_services(router), _MPRIS_TIMEOUT)
+            players = [s.removeprefix(_MPRIS_PREFIX) for s in services]
+            return {"success": True, "players": players}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "D-Bus request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform == "darwin":
+        running = []
+        for app in _MACOS_APPS:
+            if _macos_detect_player(app):
+                running.append(app)
+        return {"success": True, "players": running}
+    return _NOT_SUPPORTED
+
+
+@mcp.tool()
+async def mpris_get_now_playing(player: str = "") -> Dict[str, Any]:
+    """
+    Get the currently playing track via MPRIS2 (Linux) or osascript (macOS).
+
+    On Linux works with any MPRIS2-compliant player: Spotify, VLC, Rhythmbox,
+    Clementine, Firefox, Chromium, etc.
+    On macOS works with Spotify and Music (formerly iTunes).
+
+    Args:
+        player: Player name hint (e.g. "spotify", "vlc"). Defaults to the first
+                active player found.
+
+    Returns:
+        Dict with title, artist, album, status, position, duration, shuffle, repeat.
+    """
+    if sys.platform.startswith("linux"):
+        if not MPRIS_AVAILABLE:
+            return {"success": False, "error": "Install jeepney: pip install jeepney"}
+        try:
+            async with open_dbus_router() as router:
+                service = await asyncio.wait_for(_mpris_resolve(router, player), _MPRIS_TIMEOUT)
+                if not service:
+                    services = await _mpris_list_services(router)
+                    if services:
+                        hint = f"Available: {[s.removeprefix(_MPRIS_PREFIX) for s in services]}"
+                    else:
+                        hint = "No MPRIS players are running"
+                    return {"success": False, "error": hint}
+                props = await asyncio.wait_for(_mpris_get_props(router, service), _MPRIS_TIMEOUT)
+            track = _mpris_extract_track(props)
+            return {
+                "success": True,
+                "playing": track["status"] == "playing",
+                "player": service.removeprefix(_MPRIS_PREFIX),
+                "track": track,
+            }
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "D-Bus request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform == "darwin":
+        return await asyncio.to_thread(_macos_now_playing_sync, player)
+    return _NOT_SUPPORTED
+
+
+@mcp.tool()
+async def mpris_play(player: str = "") -> Dict[str, Any]:
+    """
+    Resume playback via MPRIS2 (Linux) or osascript (macOS).
+
+    Args:
+        player: Player name hint. Defaults to the first active player.
+
+    Returns:
+        Dict with success flag.
+    """
+    if sys.platform.startswith("linux"):
+        if not MPRIS_AVAILABLE:
+            return {"success": False, "error": "Install jeepney: pip install jeepney"}
+        try:
+            async with open_dbus_router() as router:
+                service = await _mpris_resolve(router, player)
+                if not service:
+                    return {"success": False, "error": "No MPRIS player found"}
+                await asyncio.wait_for(_mpris_call(router, service, "Play"), _MPRIS_TIMEOUT)
+            return {"success": True}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "D-Bus request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform == "darwin":
+        return await asyncio.to_thread(_macos_control_sync, "play", player)
+    return _NOT_SUPPORTED
+
+
+@mcp.tool()
+async def mpris_pause(player: str = "") -> Dict[str, Any]:
+    """
+    Pause playback via MPRIS2 (Linux) or osascript (macOS).
+
+    Args:
+        player: Player name hint. Defaults to the first active player.
+    """
+    if sys.platform.startswith("linux"):
+        if not MPRIS_AVAILABLE:
+            return {"success": False, "error": "Install jeepney: pip install jeepney"}
+        try:
+            async with open_dbus_router() as router:
+                service = await _mpris_resolve(router, player)
+                if not service:
+                    return {"success": False, "error": "No MPRIS player found"}
+                await asyncio.wait_for(_mpris_call(router, service, "Pause"), _MPRIS_TIMEOUT)
+            return {"success": True}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "D-Bus request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform == "darwin":
+        return await asyncio.to_thread(_macos_control_sync, "pause", player)
+    return _NOT_SUPPORTED
+
+
+@mcp.tool()
+async def mpris_play_pause(player: str = "") -> Dict[str, Any]:
+    """
+    Toggle play/pause via MPRIS2 (Linux) or osascript (macOS).
+
+    Args:
+        player: Player name hint. Defaults to the first active player.
+    """
+    if sys.platform.startswith("linux"):
+        if not MPRIS_AVAILABLE:
+            return {"success": False, "error": "Install jeepney: pip install jeepney"}
+        try:
+            async with open_dbus_router() as router:
+                service = await _mpris_resolve(router, player)
+                if not service:
+                    return {"success": False, "error": "No MPRIS player found"}
+                await asyncio.wait_for(_mpris_call(router, service, "PlayPause"), _MPRIS_TIMEOUT)
+            return {"success": True}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "D-Bus request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform == "darwin":
+        return await asyncio.to_thread(_macos_control_sync, "play_pause", player)
+    return _NOT_SUPPORTED
+
+
+@mcp.tool()
+async def mpris_next_track(player: str = "") -> Dict[str, Any]:
+    """
+    Skip to the next track via MPRIS2 (Linux) or osascript (macOS).
+
+    Args:
+        player: Player name hint. Defaults to the first active player.
+    """
+    if sys.platform.startswith("linux"):
+        if not MPRIS_AVAILABLE:
+            return {"success": False, "error": "Install jeepney: pip install jeepney"}
+        try:
+            async with open_dbus_router() as router:
+                service = await _mpris_resolve(router, player)
+                if not service:
+                    return {"success": False, "error": "No MPRIS player found"}
+                await asyncio.wait_for(_mpris_call(router, service, "Next"), _MPRIS_TIMEOUT)
+            return {"success": True}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "D-Bus request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform == "darwin":
+        return await asyncio.to_thread(_macos_control_sync, "next", player)
+    return _NOT_SUPPORTED
+
+
+@mcp.tool()
+async def mpris_previous_track(player: str = "") -> Dict[str, Any]:
+    """
+    Go to the previous track via MPRIS2 (Linux) or osascript (macOS).
+
+    Args:
+        player: Player name hint. Defaults to the first active player.
+    """
+    if sys.platform.startswith("linux"):
+        if not MPRIS_AVAILABLE:
+            return {"success": False, "error": "Install jeepney: pip install jeepney"}
+        try:
+            async with open_dbus_router() as router:
+                service = await _mpris_resolve(router, player)
+                if not service:
+                    return {"success": False, "error": "No MPRIS player found"}
+                await asyncio.wait_for(_mpris_call(router, service, "Previous"), _MPRIS_TIMEOUT)
+            return {"success": True}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "D-Bus request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform == "darwin":
+        return await asyncio.to_thread(_macos_control_sync, "previous", player)
+    return _NOT_SUPPORTED
+
+
+@mcp.tool()
+async def mpris_seek(position_seconds: float, player: str = "") -> Dict[str, Any]:
+    """
+    Seek to an absolute position in the current track.
+
+    On Linux uses MPRIS2 SetPosition (absolute, in microseconds).
+    On macOS uses AppleScript player position (absolute, in seconds).
+
+    Args:
+        position_seconds: Target position in seconds from the start of the track.
+        player: Player name hint. Defaults to the first active player.
+    """
+    if sys.platform.startswith("linux"):
+        if not MPRIS_AVAILABLE:
+            return {"success": False, "error": "Install jeepney: pip install jeepney"}
+        try:
+            async with open_dbus_router() as router:
+                service = await _mpris_resolve(router, player)
+                if not service:
+                    return {"success": False, "error": "No MPRIS player found"}
+                props = await _mpris_get_props(router, service)
+                track_id = str(dict(props.get("Metadata", {})).get("mpris:trackid", ""))
+                pos_us = int(position_seconds * 1_000_000)
+                await asyncio.wait_for(
+                    _mpris_call(router, service, "SetPosition",
+                                signature="ox", body=(track_id, pos_us)),
+                    _MPRIS_TIMEOUT,
+                )
+            return {"success": True, "position_seconds": position_seconds}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "D-Bus request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform == "darwin":
+        return await asyncio.to_thread(_macos_control_sync, "seek", player, position_seconds)
+    return _NOT_SUPPORTED
+
+
+@mcp.tool()
+async def mpris_set_shuffle(active: bool, player: str = "") -> Dict[str, Any]:
+    """
+    Enable or disable shuffle.
+
+    On Linux sets the MPRIS2 Shuffle property.
+    On macOS uses AppleScript (Spotify: shuffling, Music: shuffle enabled).
+
+    Args:
+        active: True to enable shuffle, False to disable.
+        player: Player name hint. Defaults to the first active player.
+    """
+    if sys.platform.startswith("linux"):
+        if not MPRIS_AVAILABLE:
+            return {"success": False, "error": "Install jeepney: pip install jeepney"}
+        try:
+            async with open_dbus_router() as router:
+                service = await _mpris_resolve(router, player)
+                if not service:
+                    return {"success": False, "error": "No MPRIS player found"}
+                await asyncio.wait_for(
+                    _mpris_set(router, service, "Shuffle", "b", active),
+                    _MPRIS_TIMEOUT,
+                )
+            return {"success": True, "shuffle": active}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "D-Bus request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform == "darwin":
+        action = "shuffle_on" if active else "shuffle_off"
+        return await asyncio.to_thread(_macos_control_sync, action, player)
+    return _NOT_SUPPORTED
+
+
+@mcp.tool()
+async def mpris_set_repeat(mode: str, player: str = "") -> Dict[str, Any]:
+    """
+    Set the repeat mode.
+
+    On Linux sets the MPRIS2 LoopStatus property.
+    On macOS uses AppleScript (note: Spotify does not distinguish track vs list repeat).
+
+    Args:
+        mode: One of "none", "track", or "list".
+        player: Player name hint. Defaults to the first active player.
+    """
+    mode = mode.lower()
+    if mode not in _MPRIS_REPEAT_MAP:
+        return {"success": False, "error": f"mode must be one of: {list(_MPRIS_REPEAT_MAP)}"}
+    if sys.platform.startswith("linux"):
+        if not MPRIS_AVAILABLE:
+            return {"success": False, "error": "Install jeepney: pip install jeepney"}
+        try:
+            loop_value = _MPRIS_REPEAT_MAP[mode]
+            async with open_dbus_router() as router:
+                service = await _mpris_resolve(router, player)
+                if not service:
+                    return {"success": False, "error": "No MPRIS player found"}
+                await asyncio.wait_for(
+                    _mpris_set(router, service, "LoopStatus", "s", loop_value),
+                    _MPRIS_TIMEOUT,
+                )
+            return {"success": True, "repeat": mode}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "D-Bus request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    elif sys.platform == "darwin":
+        action = f"repeat_{mode}"
+        return await asyncio.to_thread(_macos_control_sync, action, player)
+    return _NOT_SUPPORTED
+
+
 # ── SMTC helpers ─────────────────────────────────────────────────────────────
 
 _SMTC_NOT_AVAILABLE = {"success": False, "error": "SMTC requires Windows and: pip install winrt-Windows.Media.Control winrt-Windows.Media"}
@@ -1293,6 +1852,15 @@ You are a music assistant with access to both the Deezer catalog and the user's 
 - lastfm_love_track / lastfm_unlove_track — heart or unheart a track
 - lastfm_update_now_playing — push a now-playing status manually
 - lastfm_scrobble — submit a listen record
+
+## Linux MPRIS2 / macOS osascript — cross-platform playback control
+- mpris_list_players — list active players (Linux: any MPRIS2 app; macOS: Spotify/Music)
+- mpris_get_now_playing — current track info
+- mpris_play / mpris_pause / mpris_play_pause — playback control
+- mpris_next_track / mpris_previous_track — track navigation
+- mpris_seek — jump to position in seconds
+- mpris_set_shuffle — enable/disable shuffle
+- mpris_set_repeat — set repeat mode (none / track / list)
 
 ## Windows SMTC — real-time playback control (Windows only)
 - smtc_get_now_playing — current track from any media app (Deezer, Spotify, browser, etc.)

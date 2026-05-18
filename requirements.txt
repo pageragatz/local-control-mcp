@@ -3,6 +3,8 @@ aiohttp>=3.8.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0
 requests>=2.28.0
+# Linux only — MPRIS2 playback control via D-Bus (pure Python, no system headers)
+jeepney>=0.8.0; sys_platform == "linux"
 # Windows only — real-time playback control via SMTC
 winrt-Windows.Media.Control>=3.0.0; sys_platform == "win32"
 winrt-Windows.Media>=3.0.0; sys_platform == "win32"
