@@ -1,57 +1,52 @@
-# Deezer + Last.fm MCP Server
+# Local Control MCP
 
-A Model Context Protocol (MCP) server combining the Deezer catalog with personalized Last.fm listening data. Search and explore music, see what you're playing right now, love tracks, and scrobble — all from an LLM agent.
-
-![Example usage](exemple.png)
+A Model Context Protocol (MCP) server for local machine control and observation. Give an LLM agent the ability to see what's happening on your machine and act on it — all through a clean MCP interface with no cloud dependencies.
 
 ## Features
 
-### Last.fm Personalization
-- **Now playing**: See the track currently playing (via Deezer → Last.fm scrobbling)
-- **Listening history**: Recent tracks, top tracks and artists by time period
-- **Loved tracks**: Your hearted tracks
-- **Write actions**: Love/unlove tracks, submit scrobbles, push now-playing status
-- **Discovery**: Similar artists via Last.fm's similarity graph, track tags and wiki
+### Media Playback
+Cross-platform playback control that auto-selects the backend by OS:
+- **Windows**: System Media Transport Controls (SMTC) — any app registered with the OS (Deezer, Spotify, browser, etc.)
+- **Linux**: MPRIS2 via D-Bus (jeepney) — Spotify, VLC, Firefox, Chromium, Rhythmbox, etc.
+- **macOS**: osascript — Spotify and Music
 
-### Search
-- **Tracks**: Basic and advanced search with artist, BPM, duration, and label filters
-- **Artists**: Search by name, get details, discography, top tracks, and related artists
-- **Albums**: Search by title/artist, get full details and tracklists
-- **Playlists**: Search public playlists, get full details
+### System Observation
+- CPU usage, RAM, disk, and uptime via `psutil`
+- Battery level and charge status
+- Network interfaces and IP addresses
 
-### Discovery
-- **Charts**: Current top tracks, albums, artists, and playlists (filterable by genre)
-- **Genres**: Browse all genres, find popular artists per genre
+### Process Management
+- List running processes sorted by CPU/memory
+- Detailed process info by PID
+- Launch applications, terminate processes
 
-### Tools
+### Audio / Volume
+- Get and set system volume (0–100)
+- Toggle mute
+- Backends: `pycaw` (Windows), `pactl` (Linux), `osascript` (macOS)
 
-| Tool | Description | Key Parameters |
-|------|-------------|----------------|
-| `search_tracks` | Search tracks | query, limit (max 25), strict, order |
-| `advanced_search` | Search with multiple criteria | artist, album, track, label, dur_min/max, bpm_min/max |
-| `get_track_details` | Full track info by ID | track_id |
-| `get_artist_details` | Artist profile by ID | artist_id |
-| `get_artist_albums` | Artist discography | artist_id, limit |
-| `get_artist_top_tracks` | Artist's most popular tracks | artist_id, limit |
-| `get_artist_related` | Similar/related artists | artist_id, limit |
-| `get_album_details` | Full album info by ID | album_id |
-| `get_album_tracks` | Album tracklist | album_id |
-| `get_playlist_details` | Playlist content by ID | playlist_id |
-| `search_artists` | Search artists by name | query, limit |
-| `search_albums` | Search albums | query, limit |
-| `search_playlists` | Search public playlists | query, limit |
-| `get_genre_list` | All available genres | — |
-| `get_genre_artists` | Popular artists in a genre | genre_id, limit |
-| `get_chart` | Current music charts | genre_id (0=all), limit |
+### Clipboard
+- Read and write clipboard text via `pyperclip`
 
-### Playback Control Tools
+### Screenshots
+- Capture any monitor to a PNG file via `mss`
 
-Cross-platform playback control that auto-selects the backend based on OS:
-- **Windows**: System Media Transport Controls (SMTC) — controls any app registered with the OS media session (Deezer, Spotify, browser, etc.)
-- **Linux**: MPRIS2 via D-Bus (jeepney) — works with Spotify, VLC, Firefox, Chromium, Rhythmbox, etc.
-- **macOS**: osascript — works with Spotify and Music (no extra packages required)
+### Notifications
+- Send desktop notifications via `notify-send` (Linux), `plyer` (Windows), `osascript` (macOS)
 
-The `player` parameter is accepted by all tools but only used on Linux/macOS to select a specific app. On Windows it is silently ignored — SMTC always targets the system-active session.
+### Open / Launch
+- Open a URL in the default browser
+- Open a file in its default application
+
+### Power / Session
+- Lock the screen
+- Sleep/suspend the machine
+
+---
+
+## Tool Reference
+
+### Media Playback
 
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
@@ -66,107 +61,124 @@ The `player` parameter is accepted by all tools but only used on Linux/macOS to 
 | `set_shuffle` | Enable or disable shuffle | active, player |
 | `set_repeat` | Set repeat mode: `none`, `track`, or `list` | mode, player |
 
-All tools return `{"success": false, "error": "..."}` gracefully when the platform backend is unavailable.
+The `player` parameter is accepted by all tools but only used on Linux/macOS to select a specific app. On Windows it is silently ignored — SMTC always targets the system-active session.
 
-### Last.fm Tools
+### System Stats
 
-| Tool | Auth needed | Description |
-|------|-------------|-------------|
-| `lastfm_get_now_playing` | API key | Currently playing track |
-| `lastfm_get_recent_tracks` | API key | Listening history |
-| `lastfm_get_top_tracks` | API key | Most played tracks by period |
-| `lastfm_get_top_artists` | API key | Most played artists by period |
-| `lastfm_get_loved_tracks` | API key | Hearted tracks |
-| `lastfm_get_similar_artists` | API key | Artists similar to a given one |
-| `lastfm_get_track_info` | API key | Tags, wiki, play counts |
-| `lastfm_love_track` | Session key | Heart a track |
-| `lastfm_unlove_track` | Session key | Unheart a track |
-| `lastfm_update_now_playing` | Session key | Push now-playing status |
-| `lastfm_scrobble` | Session key | Submit a listen record |
+| Tool | Description |
+|------|-------------|
+| `get_system_info` | CPU%, RAM, disk usage, uptime, OS |
+| `get_battery` | Charge percent, plugged in, time remaining |
+| `get_network_interfaces` | Network interfaces with IPv4/IPv6 addresses |
+
+### Process Management
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `list_processes` | Running processes | sort_by (cpu/memory/name), limit |
+| `get_process` | Process details by PID | pid |
+| `kill_process` | Terminate process | pid |
+| `launch_app` | Launch an application | command |
+
+### Audio / Volume
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `get_volume` | Current volume (0-100) and mute state | — |
+| `set_volume` | Set volume | level (0-100) |
+| `toggle_mute` | Toggle mute on/off | — |
+
+### Clipboard
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `get_clipboard` | Read clipboard text | — |
+| `set_clipboard` | Write text to clipboard | text |
+
+### Screenshots
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `take_screenshot` | Capture screen to PNG file | monitor (0=all, 1=primary), save_path |
+
+### Notifications
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `send_notification` | Send desktop notification | title, message, timeout |
+
+### Open / Launch
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `open_url` | Open URL in default browser | url |
+| `open_file` | Open file in default app | path |
+
+### Power / Session
+
+| Tool | Description |
+|------|-------------|
+| `lock_screen` | Lock the desktop session |
+| `sleep_system` | Suspend the machine to RAM |
+
+All tools return `{"success": false, "error": "..."}` gracefully when a backend is unavailable or a package is missing.
+
+---
 
 ## Installation
 
 ### Prerequisites
-- Python 3.11+
+- Python 3.10+
 - [uv](https://github.com/astral-sh/uv) package manager
 
-### Local Setup
+### Setup
 
 ```bash
 # Create and activate a virtual environment
 uv venv --python 3.11
-source .venv/bin/activate
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 
 # Install dependencies
 uv pip install -r requirements.txt
 
-# Copy and fill in your credentials
-cp .env.example .env
-# Edit .env with your LASTFM_API_KEY, LASTFM_API_SECRET, LASTFM_USERNAME
-
-# (Optional) Generate a session key for write operations
-uv run lastfm_auth.py
-
 # Start the server
-uv run deezer_mcp_server.py
+uv run server.py
 ```
 
-The server runs on `http://localhost:8000` by default using SSE transport.
+The server runs on `http://localhost:8000` by default using streamable-http transport.
 
 ### Docker
 
 ```bash
-# Build and start
 docker compose up --build
-
-# Run in background
-docker compose up -d
-
-# Stop
+docker compose up -d   # background
 docker compose down
 ```
 
-### Environment Variables
+---
+
+## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCP_HOST` | `0.0.0.0` | Host to bind to |
 | `MCP_PORT` | `8000` | Port to listen on |
-| `MCP_TRANSPORT` | `sse` | Transport type (`sse` or `stdio`) |
+| `MCP_TRANSPORT` | `http` | Transport: `http`, `streamable-http`, `sse`, or `stdio` |
 
-## Last.fm Setup
-
-### 1. Get an API key
-Register at [last.fm/api/account/create](https://www.last.fm/api/account/create) — it's free and instant.
-Copy `LASTFM_API_KEY` and `LASTFM_API_SECRET` into your `.env`.
-
-### 2. Enable scrobbling from Deezer
-In the Deezer app: **Settings → Connections → Last.fm** — log in and enable scrobbling.
-Now anything you play in Deezer will appear in `lastfm_get_now_playing`.
-
-### 3. (Optional) Generate a session key for write access
-Write operations (love/unlove, scrobble, now-playing) need a session key:
-
-```bash
-uv run lastfm_auth.py
-```
-
-This opens a browser auth page, then writes `LASTFM_SESSION_KEY` and `LASTFM_USERNAME` directly into your `.env`.
+---
 
 ## Client Configuration
 
 ### AnythingLLM
 
-AnythingLLM supports MCP servers. To connect:
-
-1. Start the Deezer MCP server (`docker compose up -d` or `uv run deezer_mcp_server.py`)
-2. In AnythingLLM, go to **Settings → Agent Skills → Custom MCP Servers**
-3. Add a new server with the following config:
+1. Start the server (`docker compose up -d` or `uv run server.py`)
+2. In AnythingLLM: **Settings → Agent Skills → Custom MCP Servers**
+3. Add:
 
 ```json
 {
   "mcpServers": {
-    "deezer": {
+    "local-control": {
       "type": "streamable",
       "url": "http://localhost:8000/mcp"
     }
@@ -174,23 +186,16 @@ AnythingLLM supports MCP servers. To connect:
 }
 ```
 
-If AnythingLLM is running inside Docker and the MCP server is on your host machine, use `http://host.docker.internal:8000/mcp` instead of localhost.
+If AnythingLLM runs inside Docker and the server is on the host, use `http://host.docker.internal:8000/mcp`.
 
 ### Claude Desktop
-
-Add to `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
-    "deezer": {
+    "local-control": {
       "command": "npx",
-      "args": [
-        "mcp-remote",
-        "http://localhost:8000/sse",
-        "--transport",
-        "sse-only"
-      ]
+      "args": ["mcp-remote", "http://localhost:8000/sse", "--transport", "sse-only"]
     }
   }
 }
@@ -200,32 +205,25 @@ Add to `claude_desktop_config.json`:
 
 Connect to: `http://localhost:8000/sse`
 
-## Advanced Search Reference
+---
 
-The `advanced_search` tool builds Deezer query syntax from structured parameters:
+## Platform Notes
 
-| Parameter | Description | Example |
-|-----------|-------------|---------|
-| `artist` | Artist name | `"daft punk"` |
-| `album` | Album title | `"random access memories"` |
-| `track` | Track title | `"get lucky"` |
-| `label` | Record label | `"columbia"` |
-| `dur_min` / `dur_max` | Duration range in seconds | `180` / `300` |
-| `bpm_min` / `bpm_max` | BPM range | `120` / `140` |
+### Linux
+- **Volume**: requires `pulseaudio-utils` (`apt install pulseaudio-utils` for `pactl`)
+- **MPRIS playback**: install `jeepney` (included in requirements)
+- **Screenshots**: requires a display; Wayland support depends on compositor
+- **Clipboard**: headless environments need `xclip` or `xsel`
+- **Notifications**: requires `libnotify-bin` (`apt install libnotify-bin` for `notify-send`)
+- **Lock screen**: tries `loginctl lock-session`, then `xdg-screensaver`, then `gnome-screensaver-command`
 
-Example combining criteria:
-```python
-advanced_search({
-    "artist": "daft punk",
-    "bpm_min": 120,
-    "dur_min": 180,
-    "limit": 10
-})
-```
+### Windows
+- **Playback (SMTC)**: install `winrt-Windows.Media.Control` and `winrt-Windows.Media` (included in requirements)
+- **Volume**: install `pycaw` (included in requirements)
+- **Notifications**: install `plyer` (included in requirements)
 
-## Limitations
-
-- **Public API only** — no user authentication, no playlist modification
-- **Read-only** — cannot create or modify content
-- **Rate limiting** — respect Deezer's API rate limits
-- **Geo-restrictions** — some content may be unavailable based on region
+### macOS
+- **Playback**: uses `osascript` (no extra packages)
+- **Volume**: uses `osascript` (no extra packages)
+- **Notifications**: uses `osascript` (no extra packages)
+- **Screenshots**: works on main display; may require Screen Recording permission

@@ -3,24 +3,26 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "deezer-mcp-server"
-version = "1.0.0"
-description = "Serveur MCP pour l'API Deezer"
+name = "local-control-mcp"
+version = "2.0.0"
+description = "Cross-platform local machine control and observation via MCP"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=2.0.0",
-    "aiohttp>=3.8.0",
-    "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
-    "requests>=2.28.0",
+    "psutil>=5.9.0",
+    "mss>=9.0.0",
+    "pyperclip>=1.8.0",
+    "plyer>=2.1.0",
     "jeepney>=0.8.0; sys_platform == 'linux'",
     "winrt-Windows.Media.Control>=3.0.0; sys_platform == 'win32'",
     "winrt-Windows.Media>=3.0.0; sys_platform == 'win32'",
+    "pycaw>=20240210; sys_platform == 'win32'",
 ]
 
 [project.scripts]
-deezer-mcp-server = "deezer_mcp_server:main"
+local-control-mcp = "server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
