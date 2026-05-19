@@ -1098,7 +1098,9 @@ async def get_volume() -> Dict[str, Any]:
             )
             # "Volume: front-left: 65536 /  100% / 0.00 dB, ..."
             m = re.search(r"(\d+)%", r.stdout)
-            level = int(m.group(1)) if m else 0
+            if not m:
+                return {"success": False, "error": f"Failed to parse volume from pactl output: {r.stdout!r}"}
+            level = int(m.group(1))
             r2 = await asyncio.to_thread(
                 subprocess.run,
                 ["pactl", "get-sink-mute", "@DEFAULT_SINK@"],
@@ -1113,8 +1115,12 @@ async def get_volume() -> Dict[str, Any]:
     elif sys.platform == "darwin":
         def _get():
             raw = _osa("output volume of (get volume settings)")
+            if not raw.isdigit():
+                return {"success": False, "error": f"Failed to read volume from osascript: {raw!r}"}
             muted_raw = _osa("output muted of (get volume settings)")
-            level = int(raw) if raw.isdigit() else 0
+            if muted_raw.strip().lower() not in ("true", "false"):
+                return {"success": False, "error": f"Failed to read mute state from osascript: {muted_raw!r}"}
+            level = int(raw)
             muted = muted_raw.strip().lower() == "true"
             return {"success": True, "volume": level, "muted": muted}
         return await asyncio.to_thread(_get)
@@ -1143,11 +1149,13 @@ async def set_volume(level: int) -> Dict[str, Any]:
         return await asyncio.to_thread(_set)
     elif sys.platform.startswith("linux"):
         try:
-            await asyncio.to_thread(
+            r = await asyncio.to_thread(
                 subprocess.run,
                 ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{level}%"],
-                capture_output=True, timeout=5,
+                capture_output=True, text=True, timeout=5,
             )
+            if r.returncode != 0:
+                return {"success": False, "error": f"pactl failed: {r.stderr.strip() or r.stdout.strip()}"}
             return {"success": True, "volume": level}
         except FileNotFoundError:
             return {"success": False, "error": "pactl not found — install pulseaudio-utils"}
@@ -1199,6 +1207,8 @@ async def toggle_mute() -> Dict[str, Any]:
     elif sys.platform == "darwin":
         def _toggle():
             current = _osa("output muted of (get volume settings)")
+            if current.strip().lower() not in ("true", "false"):
+                return {"success": False, "error": f"Failed to read mute state from osascript: {current!r}"}
             new_mute = current.strip().lower() != "true"
             _osa(f"set volume output muted {str(new_mute).lower()}")
             return {"success": True, "muted": new_mute}
@@ -1519,7 +1529,25 @@ You are a local machine control assistant with tools to observe and control the 
 """
 
 
+def _check_not_root() -> None:
+    """Refuse to start if running as root/Administrator — reduces attack surface."""
+    if sys.platform == "win32":
+        import ctypes
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            sys.exit(
+                "ERROR: Refusing to start as Administrator. "
+                "Run the server as a regular (non-elevated) user."
+            )
+    elif hasattr(os, "getuid") and os.getuid() == 0:
+        sys.exit(
+            "ERROR: Refusing to start as root. "
+            "Run the server as a regular (non-root) user."
+        )
+
+
 def main():
+    _check_not_root()
+
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8000"))
     transport = os.environ.get("MCP_TRANSPORT", "http")
