@@ -400,6 +400,11 @@ async def get_now_playing(player: str = "") -> Dict[str, Any]:
             playback = session.get_playback_info()
             timeline = session.get_timeline_properties()
             status_int = int(playback.playback_status)
+            # auto_repeat_mode and is_shuffle_active are nullable in WinRT — some
+            # apps (e.g. Deezer) don't expose them, returning None instead of an enum.
+            repeat_raw = playback.auto_repeat_mode
+            repeat = _REPEAT_VALUES.get(int(repeat_raw), "unknown") if repeat_raw is not None else "unknown"
+            shuffle_raw = playback.is_shuffle_active
             return {
                 "success": True,
                 "playing": status_int == 4,
@@ -411,8 +416,8 @@ async def get_now_playing(player: str = "") -> Dict[str, Any]:
                     "status": _PLAYBACK_STATUS.get(status_int, "unknown"),
                     "position_seconds": round(timeline.position.total_seconds()),
                     "duration_seconds": round(timeline.end_time.total_seconds()),
-                    "shuffle": playback.is_shuffle_active,
-                    "repeat": _REPEAT_VALUES.get(int(playback.auto_repeat_mode), "unknown"),
+                    "shuffle": bool(shuffle_raw) if shuffle_raw is not None else None,
+                    "repeat": repeat,
                     "source_app": session.source_app_user_model_id,
                 },
             }
