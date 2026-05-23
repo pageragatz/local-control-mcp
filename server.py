@@ -253,16 +253,16 @@ def _macos_now_playing_sync(hint: str = "") -> dict:
         "success": True,
         "playing": status == "playing",
         "player": app,
-        "track": {
+        "track": _compact({
             "title": parts[1].strip() if len(parts) > 1 else "",
             "artist": parts[2].strip() if len(parts) > 2 else "",
             "album": parts[3].strip() if len(parts) > 3 else "",
             "status": status,
             "position_seconds": round(float(parts[4])) if len(parts) > 4 else 0,
             "duration_seconds": round(float(parts[5])) if len(parts) > 5 else 0,
-            "shuffle": parts[6].strip() == "true" if len(parts) > 6 else False,
+            "shuffle": parts[6].strip() == "true" if len(parts) > 6 else None,
             "repeat": "unknown",
-        },
+        }),
     }
 
 
@@ -312,6 +312,14 @@ def _macos_control_sync(action: str, hint: str = "", value=None) -> dict:
 
 
 # ── Media control (Windows SMTC · Linux MPRIS2 · macOS osascript) ─────────────
+
+_OMIT = {None, "unknown", ""}
+
+
+def _compact(d: dict) -> dict:
+    """Strip keys whose value is None, 'unknown', or '' — cleaner output for LLMs."""
+    return {k: v for k, v in d.items() if v not in _OMIT}
+
 
 _NOT_SUPPORTED = {
     "success": False,
@@ -405,22 +413,20 @@ async def get_now_playing(player: str = "") -> Dict[str, Any]:
             repeat_raw = playback.auto_repeat_mode
             repeat = _REPEAT_VALUES.get(int(repeat_raw), "unknown") if repeat_raw is not None else "unknown"
             shuffle_raw = playback.is_shuffle_active
-            return {
-                "success": True,
-                "playing": status_int == 4,
-                "track": {
-                    "title": props.title,
-                    "artist": props.artist,
-                    "album": props.album_title,
-                    "track_number": props.track_number,
-                    "status": _PLAYBACK_STATUS.get(status_int, "unknown"),
-                    "position_seconds": round(timeline.position.total_seconds()),
-                    "duration_seconds": round(timeline.end_time.total_seconds()),
-                    "shuffle": bool(shuffle_raw) if shuffle_raw is not None else None,
-                    "repeat": repeat,
-                    "source_app": session.source_app_user_model_id,
-                },
-            }
+            track_number = props.track_number or None  # 0 means "not provided"
+            track = _compact({
+                "title": props.title,
+                "artist": props.artist,
+                "album": props.album_title,
+                "track_number": track_number,
+                "status": _PLAYBACK_STATUS.get(status_int, "unknown"),
+                "position_seconds": round(timeline.position.total_seconds()),
+                "duration_seconds": round(timeline.end_time.total_seconds()),
+                "shuffle": bool(shuffle_raw) if shuffle_raw is not None else None,
+                "repeat": repeat,
+                "source_app": session.source_app_user_model_id,
+            })
+            return {"success": True, "playing": status_int == 4, "track": track}
         except asyncio.TimeoutError:
             return {"success": False, "error": "SMTC request timed out"}
         except Exception as e:
@@ -437,10 +443,10 @@ async def get_now_playing(player: str = "") -> Dict[str, Any]:
                             if services else "No MPRIS players are running")
                     return {"success": False, "error": hint}
                 props = await asyncio.wait_for(_mpris_get_props(router, service), _MPRIS_TIMEOUT)
-            track = _mpris_extract_track(props)
+            track = _compact(_mpris_extract_track(props))
             return {
                 "success": True,
-                "playing": track["status"] == "playing",
+                "playing": track.get("status") == "playing",
                 "player": service.removeprefix(_MPRIS_PREFIX),
                 "track": track,
             }
